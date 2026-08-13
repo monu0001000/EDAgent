@@ -36,7 +36,27 @@ BLOCKED_NAMES = {
 # dunder syntax appearing in the AST as an Attribute node.
 BLOCKED_METHOD_NAMES = {"format", "format_map"}
 
-MAX_RESULT_CHARS = 3000
+# A small, conservative whitelist of built-ins the agent will legitimately
+# want in pandas expressions (e.g. str(x), round(x, 2), len(df)). Earlier
+# versions gave the eval namespace NO built-ins at all ({"__builtins__": {}}),
+# which is maximally safe but also blocks completely harmless calls — in
+# practice this caused live queries like `str(r)` inside a list comprehension
+# to fail with NameError, wasting a tool-call round-trip on nothing.
+#
+# Deliberately EXCLUDED even though they're "just functions": type, dir,
+# vars, isinstance, issubclass, super, classmethod, staticmethod, property,
+# hasattr — anything that enables introspection or class-hierarchy walking
+# (the classic sandbox-escape vector, e.g. reaching a class's subclasses).
+# None of these are needed for ordinary pandas analysis expressions.
+SAFE_BUILTINS = {
+    "str": str, "int": int, "float": float, "bool": bool,
+    "len": len, "round": round, "min": min, "max": max, "sum": sum,
+    "sorted": sorted, "list": list, "dict": dict, "tuple": tuple, "set": set,
+    "abs": abs, "range": range, "enumerate": enumerate, "zip": zip,
+    "all": all, "any": any,
+}
+
+MAX_RESULT_CHARS = 1000
 
 
 def _check_ast_safety(tree: ast.AST) -> None:
@@ -95,7 +115,7 @@ def safe_query(df: pd.DataFrame, code: str) -> str:
     # Deliberately minimal namespace: no __builtins__, so things like
     # open(), __import__(), etc. are unreachable even if the AST check
     # somehow missed a novel bypass.
-    safe_globals = {"__builtins__": {}}
+    safe_globals = {"__builtins__": SAFE_BUILTINS}
     safe_locals = {"df": df, "pd": pd, "np": np}
 
     try:
@@ -111,7 +131,7 @@ def safe_query(df: pd.DataFrame, code: str) -> str:
 
 def _format_result(result) -> str:
     if isinstance(result, (pd.DataFrame, pd.Series)):
-        return result.to_string(max_rows=30)
+        return result.to_string(max_rows=12)
     return str(result)
 
 

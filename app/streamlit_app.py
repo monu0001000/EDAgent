@@ -1,9 +1,9 @@
 """
 streamlit_app.py
 EDAgent — the UI layer tying together profiler.py, visualizer.py, and
-agent.py / insight_generator.py into a single app: upload a CSV, see the
-auto-generated profile and charts, then run either the single-shot or
-agentic report generator and watch what it finds.
+groq_agent.py / groq_insight_generator.py into a single app: upload a CSV,
+see the auto-generated profile and charts, then run either the single-shot
+or agentic report generator and watch what it finds.
 
 Run with:
     cd app
@@ -150,14 +150,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if not os.environ.get("GEMINI_API_KEY"):
-    st.warning(
-        "No `GEMINI_API_KEY` found. The profiler and charts below will still work, "
-        "but generating a report needs a free key from https://aistudio.google.com/apikey "
-        "in your `.env` file.",
-        icon="🔑",
-    )
-
 uploaded = st.file_uploader("Upload a CSV", type=["csv"])
 
 if uploaded is None:
@@ -231,17 +223,23 @@ else:
 
 st.markdown("### AI Report")
 
+if not os.environ.get("GROQ_API_KEY"):
+    st.warning(
+        "No `GROQ_API_KEY` found. Add a free key from https://console.groq.com/keys "
+        "to your `.env` file to generate a report.",
+        icon="🔑",
+    )
+
 mode = st.radio(
     "Report mode",
     ["Agentic (investigates, then reports)", "Single-shot (summarizes profile only)"],
     horizontal=True,
 )
 
-if st.button("Generate report", type="primary", disabled=not os.environ.get("GEMINI_API_KEY")):
+if st.button("Generate report", type="primary", disabled=not os.environ.get("GROQ_API_KEY")):
     if "Agentic" in mode:
-        from agent import generate_insights_agentic
+        from groq_agent import generate_insights_agentic
 
-        log_placeholder = st.empty()
         with st.spinner("Agent is investigating the dataset..."):
             try:
                 result = generate_insights_agentic(df, profile, verbose=False)
@@ -257,7 +255,7 @@ if st.button("Generate report", type="primary", disabled=not os.environ.get("GEM
         st.markdown("**Report**")
         st.markdown(result["report"])
     else:
-        from insight_generator import generate_insights
+        from groq_insight_generator import generate_insights
 
         with st.spinner("Generating summary..."):
             try:

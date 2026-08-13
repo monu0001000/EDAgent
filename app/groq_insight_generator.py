@@ -1,33 +1,19 @@
 """
-insight_generator.py
-Phase 3a: Simple (single-shot) LLM summarizer — using Google Gemini's free
-API tier (Google AI Studio) instead of a paid API, so this can be run and
-demoed without spending money.
+groq_insight_generator.py
+Single-shot LLM summarizer using Groq's free API tier — the Groq equivalent
+of insight_generator.py (which uses Gemini). Same design: one call,
+summarizes the pre-computed profile only, no tool use.
 
-Takes the structured profile dict from profiler.py (NOT the raw dataframe —
-we deliberately never send raw row-level data to the LLM, only aggregated
-stats, to keep token usage low and avoid leaking sensitive values) plus the
-list of chart names from visualizer.py, and asks Gemini to write a natural
--language analysis: key patterns, data quality issues, and suggested
-business questions.
-
-This is intentionally single-shot (one prompt -> one response) as a
-baseline. agent.py upgrades this to an agentic loop where the LLM can
-request additional pandas queries instead of only seeing pre-computed stats.
-
-Setup: get a free API key at https://aistudio.google.com/apikey (no credit
-card required) and set it as GEMINI_API_KEY in your .env file.
+Setup: get a free API key at https://console.groq.com/keys (no credit card
+required) and set it as GROQ_API_KEY in your .env file.
 """
 
 import os
 import json
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from groq import Groq
 
-load_dotenv()  # reads .env in the current/parent directory automatically —
-                # means GEMINI_API_KEY doesn't need to be manually exported
-
+load_dotenv()
 
 SYSTEM_PROMPT = """You are a senior data analyst reviewing a dataset profile prepared by an automated tool.
 You will be given:
@@ -41,7 +27,14 @@ Write a concise analysis with three sections, using markdown headers:
 
 ## Data Quality Issues
 Bullet points on missing data, outliers, duplicates, or PII columns that need attention before this data is used
-for modeling or reporting. If there are no notable issues, say so briefly.
+for modeling or reporting. Specifically check each column's profile for these fields, which flag issues code
+already detected deterministically — surface them explicitly if present, don't just paraphrase the raw JSON:
+- `category_normalization_issues`: values that are likely the same category but differ by whitespace/case
+  (e.g. "Bandra" vs "  Bandra  ", "High" vs "high") — these should probably be merged before analysis.
+- `duplicate_id_values`: a column that looks like it should be a unique identifier but has repeated values.
+- `mixed_numeric_text`: a column that's mostly numeric but has some non-numeric values mixed in.
+- `unparseable_values`: a datetime column with values present but invalid (e.g. an impossible time like "25:00").
+If there are no notable issues, say so briefly.
 
 ## Suggested Questions
 3-4 business questions this dataset could help answer, based on what's actually present in the columns.
@@ -55,8 +48,6 @@ Rules:
 
 
 def build_user_prompt(profile: dict, chart_names: list[str]) -> str:
-    """Build the user-turn content sent to the LLM. Separated out so it can be
-    unit-tested / inspected without needing to make a live API call."""
     return (
         "Dataset profile:\n"
         f"{json.dumps(profile, indent=2, default=str)}\n\n"
@@ -66,28 +57,23 @@ def build_user_prompt(profile: dict, chart_names: list[str]) -> str:
 
 
 def generate_insights(profile: dict, chart_names: list[str], model: str | None = None) -> str:
-    """Call the Gemini API once with the profile + chart list, return markdown insights text.
+    """Call Groq once with the profile + chart list, return markdown insights text.
 
-    Model defaults to the GEMINI_MODEL env var if set, otherwise "gemini-flash-latest" — a
-    Google-maintained alias that always points at their current recommended free Flash
-    model, so it won't break every time they retire/rename a specific version. Run
-    list_models.py to see everything your key can access if you want a pinned version.
+    Model defaults to the GROQ_MODEL env var if set, otherwise "llama-3.3-70b-versatile".
     """
-    model = model or os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
-    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-    user_content = build_user_prompt(profile, chart_names)
+    model = model or os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+    client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-    response = client.models.generate_content(
+    response = client.chat.completions.create(
         model=model,
-        contents=user_content,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            max_output_tokens=3000,  # newer models can spend part of this on internal
-                                      # reasoning before the visible answer, so give headroom
-        ),
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_user_prompt(profile, chart_names)},
+        ],
+        max_completion_tokens=3000,
+        temperature=0.3,
     )
-
-    return response.text
+    return response.choices[0].message.content
 
 
 if __name__ == "__main__":
@@ -99,7 +85,7 @@ if __name__ == "__main__":
     rng = np.random.default_rng(0)
     n = 200
     monthly_spend = rng.normal(50, 15, n)
-    monthly_spend[0] = 5000  # inject an outlier
+    monthly_spend[0] = 5000
     test_df = pd.DataFrame({
         "customer_id": range(1, n + 1),
         "email": [f"user{i}@test.com" for i in range(n)],
@@ -114,6 +100,6 @@ if __name__ == "__main__":
     profile = profile_dataframe(test_df)
     charts = generate_charts(test_df, profile)
 
-    print("Calling Gemini API for insights...\n")
+    print("Calling Groq API for insights...\n")
     insights = generate_insights(profile, list(charts.keys()))
     print(insights)

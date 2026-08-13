@@ -96,6 +96,94 @@ def detect_pii(series: pd.Series, col_name: str, col_type: str = "text") -> str 
     return None
 
 
+# ---------- Category normalization issues ----------
+
+def detect_category_normalization_issues(series: pd.Series, max_examples: int = 5) -> list[dict]:
+    """
+    Detect categorical values that are likely the same real-world category
+    but differ by whitespace or case (e.g. "Bandra" vs "  Bandra  ", or
+    "High" vs "high" vs "MEDIUM"/"Medium"). These are extremely common in
+    real messy data and easy for an LLM to miss when it's reasoning over
+    aggregated stats rather than scanning raw unique values — but trivial
+    for code to catch deterministically, every time, at zero token cost.
+
+    Returns a list of {"normalized": str, "variants": [...], "counts": {...}}
+    for each group of raw values that collapse into the same normalized form.
+    """
+    s = series.dropna().astype(str)
+    if s.empty:
+        return []
+
+    normalized = s.str.strip().str.lower()
+    groups = {}
+    for raw, norm in zip(s, normalized):
+        groups.setdefault(norm, set()).add(raw)
+
+    issues = []
+    for norm, variants in groups.items():
+        if len(variants) > 1:
+            counts = {v: int((s == v).sum()) for v in variants}
+            issues.append({
+                "normalized": norm,
+                "variants": sorted(variants),
+                "counts": counts,
+            })
+        if len(issues) >= max_examples:
+            break
+    return issues
+
+
+# ---------- Duplicate ID values ----------
+
+def detect_duplicate_id_values(series: pd.Series) -> dict:
+    """
+    For a column that looks like an identifier (id_like type — expected to
+    be unique per row), check whether any values actually repeat. A repeat
+    in what looks like a primary/foreign key column usually signals a data
+    entry error (e.g. a copy-paste mistake or an off-by-one typo), distinct
+    from whole-row duplication which profile_dataframe already checks.
+    """
+    s = series.dropna()
+    if s.empty:
+        return {"count": 0, "examples": []}
+    dupes = s[s.duplicated(keep=False)]
+    if dupes.empty:
+        return {"count": 0, "examples": []}
+    value_counts = dupes.value_counts()
+    return {
+        "count": int(len(value_counts)),
+        "examples": [{"value": str(v), "occurrences": int(c)} for v, c in value_counts.head(5).items()],
+    }
+
+
+# ---------- Mixed numeric/text formatting ----------
+
+def detect_mixed_numeric_text(series: pd.Series, threshold: float = 0.7) -> dict | None:
+    """
+    Detect a column where most values look numeric but a minority don't
+    (e.g. a "platform" column that's mostly "1", "2", "3" but has one "Two"
+    spelled out). This kind of inconsistency silently breaks downstream
+    numeric operations and is easy to miss when a column gets bucketed as
+    "categorical" simply because it has few unique values — the type
+    classification doesn't by itself surface that most-but-not-all values
+    share a different format.
+    """
+    s = series.dropna().astype(str)
+    if s.empty:
+        return None
+
+    numeric_mask = pd.to_numeric(s, errors="coerce").notna()
+    numeric_ratio = numeric_mask.mean()
+
+    if threshold <= numeric_ratio < 1.0:
+        non_numeric_examples = s[~numeric_mask].unique()[:5].tolist()
+        return {
+            "numeric_ratio": round(float(numeric_ratio), 3),
+            "non_numeric_examples": non_numeric_examples,
+        }
+    return None
+
+
 # ---------- Outlier detection ----------
 
 def detect_outliers_iqr(series: pd.Series) -> dict:
@@ -155,13 +243,53 @@ def profile_dataframe(df: pd.DataFrame) -> dict:
         elif col_type == "categorical":
             top_vals = series.value_counts(dropna=True).head(5)
             col_info["top_values"] = {str(k): int(v) for k, v in top_vals.items()}
+            normalization_issues = detect_category_normalization_issues(series)
+            if normalization_issues:
+                col_info["category_normalization_issues"] = normalization_issues
 
         elif col_type == "datetime":
             parsed = pd.to_datetime(series, errors="coerce")
+            # A value can be non-null in the raw column but still fail to
+            # parse as a valid datetime (e.g. "25:00" — an invalid hour).
+            # missing_count above only reflects raw nulls, so without this,
+            # a genuinely broken value like this would silently vanish from
+            # the profile instead of being flagged.
+            raw_non_null = series.notna()
+            unparseable = int((raw_non_null & parsed.isna()).sum())
             col_info["date_range"] = {
                 "min": str(parsed.min()),
                 "max": str(parsed.max()),
             }
+            if unparseable > 0:
+                bad_examples = series[raw_non_null & parsed.isna()].astype(str).unique()[:5].tolist()
+                col_info["unparseable_values"] = {
+                    "count": unparseable,
+                    "examples": bad_examples,
+                }
+
+        if col_type in ("categorical", "text"):
+            mixed = detect_mixed_numeric_text(series)
+            if mixed:
+                col_info["mixed_numeric_text"] = mixed
+
+        # Duplicate-value check: deliberately NOT gated behind col_type ==
+        # "id_like". detect_column_type requires >95% uniqueness to label a
+        # column id_like in the first place — but a duplicate is exactly
+        # what drops that ratio below the threshold, so gating this check
+        # behind the id_like label would make it unable to fire in the
+        # exact case it exists to catch (found via real-world testing: a
+        # duplicated train_id fell through to "text" classification and the
+        # duplicate went unreported). Instead, compute uniqueness directly
+        # here and apply a looser threshold — high-but-not-perfect
+        # uniqueness is itself the signal that a column was probably
+        # intended to be a unique key.
+        non_null = series.dropna()
+        if len(non_null) > 0 and col_type != "empty":
+            uniqueness_ratio = non_null.nunique() / len(non_null)
+            if uniqueness_ratio > 0.8:
+                dup_info = detect_duplicate_id_values(series)
+                if dup_info["count"] > 0:
+                    col_info["duplicate_id_values"] = dup_info
 
         profile["columns"][col] = col_info
 

@@ -1,0 +1,270 @@
+"""
+test_groq_agent.py
+Tests the Groq agentic loop logic (groq_agent.py) using a mocked Groq
+client, mirroring test_agent.py's approach for the Gemini version. Verifies
+message formatting, tool execution wiring, and rate-limit retry behavior
+without needing a live API key or making real network calls.
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(__file__))
+
+from unittest.mock import MagicMock, patch
+import pandas as pd
+import pytest
+
+from groq_agent import (
+    generate_insights_agentic, _create_with_retry,
+    _build_messages, KEEP_LAST_FULL_TURNS,
+)
+from groq import RateLimitError
+
+
+def _final_message(text):
+    """A response with no tool calls — the model's final answer."""
+    msg = MagicMock()
+    msg.tool_calls = None
+    msg.content = text
+    response = MagicMock()
+    response.choices = [MagicMock(message=msg)]
+    return response
+
+
+def _tool_call_message(expression, call_id="call_1"):
+    """A response requesting one tool call."""
+    tc = MagicMock()
+    tc.id = call_id
+    tc.function.name = "run_pandas_query"
+    tc.function.arguments = f'{{"expression": {expression!r}}}'
+
+    msg = MagicMock()
+    msg.tool_calls = [tc]
+    msg.content = None
+    response = MagicMock()
+    response.choices = [MagicMock(message=msg)]
+    return response
+
+
+@pytest.fixture
+def df():
+    return pd.DataFrame({"a": [1, 2, 3, 4, 5], "b": ["x", "y", "x", "y", "z"]})
+
+@pytest.fixture
+def profile():
+    return {"shape": {"rows": 5, "cols": 2}, "columns": {}}
+
+
+def test_agent_returns_immediately_if_no_tool_use(df, profile):
+    mock_response = _final_message("## Key Patterns\n- nothing notable")
+
+    with patch("groq_agent.Groq") as MockClient:
+        MockClient.return_value.chat.completions.create.return_value = mock_response
+        result = generate_insights_agentic(df, profile, verbose=False)
+
+    assert "Key Patterns" in result["report"]
+    assert result["tool_calls"] == []
+    assert result["iterations"] == 0
+
+def test_agent_executes_tool_call_and_continues(df, profile):
+    first_response = _tool_call_message("df['a'].mean()")
+    second_response = _final_message("## Key Patterns\n- mean of a is 3.0")
+
+    with patch("groq_agent.Groq") as MockClient:
+        mock_create = MockClient.return_value.chat.completions.create
+        mock_create.side_effect = [first_response, second_response]
+        result = generate_insights_agentic(df, profile, verbose=False)
+
+    assert len(result["tool_calls"]) == 1
+    assert result["tool_calls"][0]["expression"] == "df['a'].mean()"
+    assert result["tool_calls"][0]["result"] == "3.0"
+    assert "mean of a is 3.0" in result["report"]
+
+def test_agent_rejects_unsafe_query_but_continues_loop(df, profile):
+    first_response = _tool_call_message("open('/etc/passwd')")
+    second_response = _final_message("## Key Patterns\n- could not inspect further")
+
+    with patch("groq_agent.Groq") as MockClient:
+        mock_create = MockClient.return_value.chat.completions.create
+        mock_create.side_effect = [first_response, second_response]
+        result = generate_insights_agentic(df, profile, verbose=False)
+
+    assert "rejected" in result["tool_calls"][0]["result"].lower()
+
+def test_agent_respects_max_iterations_cap(df, profile):
+    looping_response = _tool_call_message("df['a'].sum()")
+    forced_final_response = _final_message("## Key Patterns\n- forced final answer")
+
+    with patch("groq_agent.Groq") as MockClient:
+        mock_create = MockClient.return_value.chat.completions.create
+        mock_create.side_effect = [looping_response] * 4 + [forced_final_response]
+        result = generate_insights_agentic(df, profile, max_iterations=3, verbose=False)
+
+    assert result["iterations"] == 3
+    assert len(result["tool_calls"]) == 4
+    assert "forced final answer" in result["report"]
+
+def test_agent_appends_tool_role_message_with_correct_id(df, profile):
+    """Verify the message list sent on the second call includes a
+    role='tool' message referencing the correct tool_call_id — this is the
+    OpenAI-compatible shape Groq expects, different from Gemini's
+    Content/Part objects."""
+    first_response = _tool_call_message("df['a'].mean()", call_id="abc123")
+    second_response = _final_message("done")
+
+    with patch("groq_agent.Groq") as MockClient:
+        mock_create = MockClient.return_value.chat.completions.create
+        mock_create.side_effect = [first_response, second_response]
+        generate_insights_agentic(df, profile, verbose=False)
+
+    second_call_kwargs = mock_create.call_args_list[1].kwargs
+    messages = second_call_kwargs["messages"]
+
+    # index 0 = system, 1 = initial user turn, 2 = assistant's tool_call
+    # turn, 3 = our tool-role message with the result
+    tool_msg = messages[3]
+    assert tool_msg["role"] == "tool"
+    assert tool_msg["tool_call_id"] == "abc123"
+    assert tool_msg["content"] == "3.0"
+
+
+# ---------- Rate limit retry ----------
+
+def _rate_limit_error(retry_after=None):
+    response = MagicMock()
+    response.headers = {"retry-after": str(retry_after)} if retry_after else {}
+    return RateLimitError("rate limited", response=response, body=None)
+
+def test_retry_succeeds_after_one_rate_limit(monkeypatch):
+    monkeypatch.setattr("groq_agent.time.sleep", lambda s: None)
+
+    mock_client = MagicMock()
+    final_response = _final_message("ok")
+    mock_client.chat.completions.create.side_effect = [_rate_limit_error(), final_response]
+
+    result = _create_with_retry(mock_client, "llama-3.3-70b-versatile", [], [], verbose=False)
+    assert result.choices[0].message.content == "ok"
+    assert mock_client.chat.completions.create.call_count == 2
+
+def test_retry_respects_retry_after_header(monkeypatch):
+    """If Groq sends a Retry-After header, we should wait that long rather
+    than our own fixed default."""
+    sleep_calls = []
+    monkeypatch.setattr("groq_agent.time.sleep", lambda s: sleep_calls.append(s))
+
+    mock_client = MagicMock()
+    final_response = _final_message("ok")
+    mock_client.chat.completions.create.side_effect = [_rate_limit_error(retry_after=7), final_response]
+
+    _create_with_retry(mock_client, "llama-3.3-70b-versatile", [], [], verbose=False)
+    assert sleep_calls == [7.0]
+
+def test_retry_gives_up_after_max_retries(monkeypatch):
+    monkeypatch.setattr("groq_agent.time.sleep", lambda s: None)
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = _rate_limit_error()
+
+    with pytest.raises(RateLimitError):
+        _create_with_retry(mock_client, "llama-3.3-70b-versatile", [], [], max_retries=3, verbose=False)
+    assert mock_client.chat.completions.create.call_count == 3
+
+
+# ---------- Context windowing ----------
+# Mirrors the same fix in agent.py (Gemini): OpenAI-style message lists
+# have the identical unbounded-growth problem — every tool call appends an
+# assistant message + a tool message, forever. These tests prove message
+# count stays constant regardless of how many iterations run.
+
+def test_build_messages_stays_bounded_regardless_of_history_length():
+    base = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+    history = [
+        {
+            "assistant_message": {"role": "assistant", "content": None, "tool_calls": [f"tc_{i}"]},
+            "tool_messages": [{"role": "tool", "tool_call_id": f"tc_{i}", "content": f"result {i}" * 20}],
+            "calls": [{"expression": f"q{i}", "result": f"result data {i}" * 20}],
+        }
+        for i in range(10)
+    ]
+
+    messages = _build_messages(base, history)
+    expected_len = len(base) + 1 + KEEP_LAST_FULL_TURNS * 2  # base + 1 merged summary + recent turns
+    assert len(messages) == expected_len
+
+    # Doubling history length must not change message count at all.
+    longer_history = history + history
+    messages_longer = _build_messages(base, longer_history)
+    assert len(messages_longer) == expected_len
+
+def test_build_messages_keeps_most_recent_turns_in_full():
+    base = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+    history = [
+        {
+            "assistant_message": {"role": "assistant", "content": None, "tool_calls": [f"tc_{i}"]},
+            "tool_messages": [{"role": "tool", "tool_call_id": f"tc_{i}", "content": f"r{i}"}],
+            "calls": [{"expression": f"q{i}", "result": f"r{i}"}],
+        }
+        for i in range(5)
+    ]
+
+    messages = _build_messages(base, history)
+    tail = messages[-(KEEP_LAST_FULL_TURNS * 2):]
+    expected_tail = []
+    for record in history[-KEEP_LAST_FULL_TURNS:]:
+        expected_tail.append(record["assistant_message"])
+        expected_tail.extend(record["tool_messages"])
+    assert tail == expected_tail
+
+def test_build_messages_compacts_old_turns_into_short_merged_summary():
+    base = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+    long_result = "x" * 5000
+    history = [
+        {
+            "assistant_message": {"role": "assistant", "content": None, "tool_calls": ["tc_0"]},
+            "tool_messages": [{"role": "tool", "tool_call_id": "tc_0", "content": long_result}],
+            "calls": [{"expression": "df.groupby('a').describe()", "result": long_result}],
+        }
+    ] + [
+        {
+            "assistant_message": {"role": "assistant", "content": None, "tool_calls": [f"tc_{i}"]},
+            "tool_messages": [{"role": "tool", "tool_call_id": f"tc_{i}", "content": f"r{i}"}],
+            "calls": [{"expression": f"q{i}", "result": f"r{i}"}],
+        }
+        for i in range(1, KEEP_LAST_FULL_TURNS + 2)
+    ]
+
+    messages = _build_messages(base, history)
+    summary_msg = messages[len(base)]  # right after base messages
+    assert summary_msg["role"] == "user"
+    assert "df.groupby('a').describe()" in summary_msg["content"]
+    assert len(summary_msg["content"]) < 500
+    assert "omitted" in summary_msg["content"].lower()
+
+def test_end_to_end_message_count_plateaus_across_many_iterations(df, profile):
+    dense_expr = "df.groupby('b').describe()"
+    looping_response = _tool_call_message(dense_expr)
+    forced_final_response = _final_message("## Key Patterns\n- done")
+
+    with patch("groq_agent.Groq") as MockClient:
+        mock_create = MockClient.return_value.chat.completions.create
+        mock_create.side_effect = [looping_response] * 7 + [forced_final_response]
+        generate_insights_agentic(df, profile, max_iterations=6, verbose=False)
+
+    call_args = mock_create.call_args_list
+    message_lengths = [len(c.kwargs["messages"]) for c in call_args]
+
+    # Within the loop (indices 0-6, all tool-call rounds), message count
+    # should plateau once the window fills — the last loop call's count
+    # must match a middling call's, not still be climbing.
+    loop_lengths = message_lengths[:-1]  # exclude the forced-final call
+    assert loop_lengths[-1] == loop_lengths[3]
+
+    # The forced-final call (last one) intentionally adds exactly one extra
+    # system message on top of the plateaued window ("write your final
+    # report now") — so it should be +1 versus the loop plateau, not
+    # unboundedly larger.
+    assert message_lengths[-1] == loop_lengths[-1] + 1
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

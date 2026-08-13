@@ -52,10 +52,6 @@ def test_app_shows_upload_prompt_before_any_file():
     assert "csv" in all_text.lower() or "upload" in all_text.lower()
 
 def test_app_handles_csv_upload_end_to_end():
-    """Drives an actual file through the uploader and verifies the
-    profiler -> chart pipeline runs without raising inside Streamlit's
-    execution model (this is the thing unit tests on profiler.py alone
-    can't catch)."""
     at = AppTest.from_file("streamlit_app.py")
     at.run(timeout=15)
 
@@ -64,14 +60,12 @@ def test_app_handles_csv_upload_end_to_end():
     at.run(timeout=30)
 
     assert not at.exception
-    # Should have rendered stat cards, column details, and charts —
-    # a bare "upload a file" page has only ~2 markdown elements.
     assert len(at.markdown) > 5
 
 def test_report_button_disabled_without_api_key(monkeypatch):
-    """The Generate report button must be disabled when no GEMINI_API_KEY
-    is set, so a user can't click it and get a confusing API error."""
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    """The Generate report button must be disabled when GROQ_API_KEY is
+    not set, so a user can't click it and get a confusing API error."""
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
 
     at = AppTest.from_file("streamlit_app.py")
     at.run(timeout=15)
@@ -83,6 +77,18 @@ def test_report_button_disabled_without_api_key(monkeypatch):
     assert len(at.button) == 1
     assert at.button[0].disabled is True
 
+def test_report_button_enabled_with_api_key(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "fake-key-for-test")
+
+    at = AppTest.from_file("streamlit_app.py")
+    at.run(timeout=15)
+    uploader = at.file_uploader[0]
+    uploader.set_value([("sample.csv", _sample_csv_bytes(), "text/csv")])
+    at.run(timeout=30)
+
+    assert not at.exception
+    assert at.button[0].disabled is False
+
 def test_report_mode_radio_has_both_options():
     at = AppTest.from_file("streamlit_app.py")
     at.run(timeout=15)
@@ -91,10 +97,10 @@ def test_report_mode_radio_has_both_options():
     at.run(timeout=30)
 
     assert not at.exception
-    assert len(at.radio) == 1
-    options = at.radio[0].options
-    assert any("Agentic" in o for o in options)
-    assert any("Single-shot" in o for o in options)
+    assert len(at.radio) == 1  # only the Report mode radio now — no provider picker
+    mode_radio = at.radio[0]
+    assert any("Agentic" in o for o in mode_radio.options)
+    assert any("Single-shot" in o for o in mode_radio.options)
 
 
 if __name__ == "__main__":

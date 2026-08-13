@@ -12,7 +12,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from profiler import profile_dataframe, detect_column_type, detect_pii, detect_outliers_iqr
+from profiler import (
+    profile_dataframe, detect_column_type, detect_pii, detect_outliers_iqr,
+    detect_category_normalization_issues, detect_duplicate_id_values, detect_mixed_numeric_text,
+)
 from visualizer import generate_charts
 from sandbox import safe_query, UnsafeQueryError
 
@@ -117,6 +120,114 @@ def test_profile_handles_empty_dataframe():
     profile = profile_dataframe(df)
     assert profile["shape"]["rows"] == 0
     assert profile["columns"] == {}
+
+
+# ---------- Category normalization issues ----------
+# These mirror real issues found testing against a messy real-world CSV
+# (train commuter data): "Bandra" vs "  Bandra  ", "High" vs "high" vs
+# "MEDIUM" vs "Medium" — an LLM reasoning over aggregated stats missed all
+# of these, but they're trivial for code to catch deterministically.
+
+def test_category_normalization_detects_whitespace_variant():
+    s = pd.Series(["Bandra", "Bandra", "  Bandra  ", "Andheri"])
+    issues = detect_category_normalization_issues(s)
+    assert len(issues) == 1
+    assert issues[0]["normalized"] == "bandra"
+    assert set(issues[0]["variants"]) == {"Bandra", "  Bandra  "}
+    assert issues[0]["counts"]["Bandra"] == 2
+    assert issues[0]["counts"]["  Bandra  "] == 1
+
+def test_category_normalization_detects_case_variants():
+    s = pd.Series(["High", "high", "Medium", "MEDIUM", "Medium", "Low"])
+    issues = detect_category_normalization_issues(s)
+    normalized_forms = {i["normalized"] for i in issues}
+    assert "high" in normalized_forms
+    assert "medium" in normalized_forms
+
+def test_category_normalization_no_false_positive_on_clean_data():
+    s = pd.Series(["High", "Medium", "Low", "High", "Medium"])
+    assert detect_category_normalization_issues(s) == []
+
+def test_category_normalization_does_not_catch_genuine_typos():
+    # "Thane" vs "Thna" is a real typo, not a whitespace/case issue — this
+    # detector deliberately does NOT try to catch it (that would need fuzzy
+    # matching, which risks false positives on genuinely distinct short
+    # names). Documenting this as a known, intentional limitation.
+    s = pd.Series(["Thane", "Thna", "Thane"])
+    assert detect_category_normalization_issues(s) == []
+
+
+# ---------- Duplicate ID values ----------
+
+def test_duplicate_id_values_detected():
+    s = pd.Series(["TRN1000", "TRN1001", "TRN1014", "TRN1014", "TRN1016"])
+    result = detect_duplicate_id_values(s)
+    assert result["count"] == 1
+    assert result["examples"][0]["value"] == "TRN1014"
+    assert result["examples"][0]["occurrences"] == 2
+
+def test_duplicate_id_values_none_when_all_unique():
+    s = pd.Series(["A1", "A2", "A3"])
+    result = detect_duplicate_id_values(s)
+    assert result["count"] == 0
+    assert result["examples"] == []
+
+
+# ---------- Mixed numeric/text formatting ----------
+
+def test_mixed_numeric_text_detected():
+    s = pd.Series(["1", "2", "3", "Two", "4", "5"])
+    result = detect_mixed_numeric_text(s)
+    assert result is not None
+    assert "Two" in result["non_numeric_examples"]
+    assert 0.7 < result["numeric_ratio"] < 1.0  # 5/6 = 0.833
+
+def test_mixed_numeric_text_not_flagged_when_fully_numeric():
+    s = pd.Series(["1", "2", "3", "4"])
+    assert detect_mixed_numeric_text(s) is None
+
+def test_mixed_numeric_text_not_flagged_when_mostly_text():
+    # If most values are genuinely non-numeric (below threshold), this is
+    # just a normal text/categorical column, not a formatting inconsistency.
+    s = pd.Series(["red", "blue", "green", "1"])
+    assert detect_mixed_numeric_text(s, threshold=0.7) is None
+
+
+# ---------- Integration: unparseable datetime values ----------
+
+def test_profile_flags_unparseable_datetime_value_separately_from_missing():
+    """A value that's present (not null) but fails to parse as a valid
+    datetime — like '25:00', an invalid hour — must be surfaced distinctly
+    from missing_count, which only reflects raw nulls. Without this, an
+    unparseable-but-present value silently disappears from the profile.
+    Uses enough rows that the single bad value doesn't itself push the
+    column below detect_column_type's own datetime-detection threshold."""
+    times = ["08:00", "09:15", "10:30", "11:45", "12:00",
+             "13:15", "14:30", "15:45", "16:00", "17:15", "25:00"]
+    df = pd.DataFrame({"scheduled_time": times})
+    profile = profile_dataframe(df)
+    col_info = profile["columns"]["scheduled_time"]
+    assert col_info["inferred_type"] == "datetime"
+    assert col_info["missing_count"] == 0  # nothing is null
+    assert col_info["unparseable_values"]["count"] == 1
+    assert "25:00" in col_info["unparseable_values"]["examples"]
+
+def test_profile_integration_catches_all_real_world_messy_data_issues():
+    """End-to-end check mirroring the actual messy dataset that surfaced
+    these gaps: whitespace-padded categories, case-duplicate categories,
+    a duplicated ID, and a mixed numeric/text column, all in one profile."""
+    df = pd.DataFrame({
+        "train_id": ["TRN1", "TRN2", "TRN3", "TRN3", "TRN4", "TRN5", "TRN6"],
+        "station": ["Bandra", "  Bandra  ", "Andheri", "Andheri", "Dadar", "Thane", "Kalyan"],
+        "crowd": ["High", "high", "Medium", "Medium", "Low", "Low", "High"],
+        "platform": ["1", "2", "Two", "3", "4", "1", "2"],
+    })
+    profile = profile_dataframe(df)
+
+    assert profile["columns"]["train_id"]["duplicate_id_values"]["count"] == 1
+    assert len(profile["columns"]["station"]["category_normalization_issues"]) == 1
+    assert len(profile["columns"]["crowd"]["category_normalization_issues"]) == 1
+    assert profile["columns"]["platform"]["mixed_numeric_text"]["non_numeric_examples"] == ["Two"]
 
 
 # ---------- Visualizer ----------
