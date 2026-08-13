@@ -1,16 +1,14 @@
 """
 groq_agent.py
-Agentic insight generator using Groq's free API tier as an alternative to
-agent.py (which uses Gemini). Groq's free tier has a much higher per-minute
-request limit (30 RPM vs as low as 5 RPM on some Gemini models), which
-matters a lot for this project since the agentic loop can make several
-calls in quick succession.
+Agentic insight generator using Groq's free API tier: the LLM decides what's
+worth investigating, runs its own pandas queries against the dataframe (via
+the sandboxed run_pandas_query tool), and iterates before writing a final
+markdown report. Slower and more expensive than groq_insight_generator.py's
+single-shot mode, but sharper — it can chase down a hypothesis instead of
+only summarizing the pre-computed profile.
 
-Groq exposes an OpenAI-compatible chat completions API, so the tool-calling
-shape here (tools as JSON schemas, tool_calls in the response, role="tool"
-for results) differs from agent.py's Gemini-specific Content/Part objects,
-but the underlying design — sandboxed run_pandas_query tool, iterative
-investigation, then a final markdown report — is identical.
+Groq exposes an OpenAI-compatible chat completions API: tools as JSON
+schemas, tool_calls in the response, role="tool" for results.
 
 Setup: get a free API key at https://console.groq.com/keys (no credit card
 required) and set it as GROQ_API_KEY in your .env file.

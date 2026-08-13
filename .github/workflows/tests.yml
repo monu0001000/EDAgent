@@ -1,0 +1,35 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run test suite
+        # No API key is set here on purpose — the LLM-calling tests are
+        # mocked (see test_groq_agent.py), so the suite runs fully offline
+        # and doesn't depend on Groq's API being reachable or a secret
+        # being configured for external contributors' PRs.
+        run: |
+          cd app
+          python3 -m pytest -v

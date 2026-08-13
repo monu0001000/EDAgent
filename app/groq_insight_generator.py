@@ -1,8 +1,8 @@
 """
 groq_insight_generator.py
-Single-shot LLM summarizer using Groq's free API tier — the Groq equivalent
-of insight_generator.py (which uses Gemini). Same design: one call,
-summarizes the pre-computed profile only, no tool use.
+Single-shot LLM summarizer: one API call, summarizes the pre-computed
+profile only, no tool use. The faster/simpler alternative to groq_agent.py's
+agentic mode, which lets the model run its own pandas queries first.
 
 Setup: get a free API key at https://console.groq.com/keys (no credit card
 required) and set it as GROQ_API_KEY in your .env file.

@@ -18,6 +18,7 @@ give it real Python. Instead:
 """
 
 import ast
+import multiprocessing as mp
 import pandas as pd
 import numpy as np
 
@@ -57,6 +58,65 @@ SAFE_BUILTINS = {
 }
 
 MAX_RESULT_CHARS = 1000
+
+# The AST checks above stop code-injection (imports, dunder access,
+# format-string escapes), but a syntactically "safe" expression can still
+# be computationally hostile — e.g. building a huge array or looping
+# forever inside a comprehension. Neither of those trips any AST rule, so
+# they're bounded here instead: the query runs in an isolated child
+# process with a wall-clock timeout and a memory cap, and that process is
+# killed outright if it exceeds either. This only protects the sandboxed
+# query itself, not the main app process.
+QUERY_TIMEOUT_SECONDS = 5
+QUERY_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024  # 512 MB
+
+# multiprocessing's "fork" start method is what makes this cheap: on
+# Linux/macOS, os.fork() gives the child a copy-on-write view of the
+# parent's memory (including `df`), so the dataframe doesn't need to be
+# pickled/copied for every single query the agent runs. "fork" isn't
+# available on Windows — see the fallback in safe_query().
+#
+# Trade-off worth knowing: forking from a multi-threaded process (which
+# Streamlit's server is) carries a small, well-documented risk of the
+# child deadlocking if fork() lands while another thread holds a C-level
+# lock (e.g. inside malloc). We accept this here because the forked
+# child does one tiny, fast thing (eval one expression, send a string
+# back, exit) and is hard-killed by the timeout regardless — a stuck
+# child costs at most QUERY_TIMEOUT_SECONDS, it doesn't hang the app. The
+# alternative, "forkserver", avoids that risk but loses the copy-on-write
+# sharing of `df`, meaning it would re-pickle the whole dataframe on
+# every single query — a bad trade for a tool the agent calls up to 5
+# times per report. If this sandbox were handling much larger dataframes
+# or higher query volume, forkserver (accepting the pickling cost) would
+# be the safer default; revisit if that changes.
+_FORK_AVAILABLE = "fork" in mp.get_all_start_methods()
+
+
+def _run_isolated(safe_globals: dict, safe_locals: dict, tree: ast.AST, conn) -> None:
+    """Runs in the forked child process. Applies a best-effort memory cap
+    (POSIX only, via `resource`), evaluates the expression, and sends the
+    formatted result string back over the pipe. Any crash of this process
+    (OOM-killed, hit the memory cap, etc.) is handled by the parent, which
+    is watching the process rather than blocking on this function."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        cap = QUERY_MEMORY_LIMIT_BYTES
+        if hard != resource.RLIM_INFINITY:
+            cap = min(cap, hard)
+        resource.setrlimit(resource.RLIMIT_AS, (cap, hard))
+    except Exception:
+        pass  # e.g. resource module unavailable on this platform
+
+    try:
+        result = eval(compile(tree, "<agent_query>", mode="eval"), safe_globals, safe_locals)
+        conn.send(("ok", _format_result(result)))
+    except MemoryError:
+        conn.send(("error", "Query exceeded the memory limit and was terminated."))
+    except Exception as e:
+        conn.send(("error", f"Query failed with error: {type(e).__name__}: {e}"))
+    finally:
+        conn.close()
 
 
 def _check_ast_safety(tree: ast.AST) -> None:
@@ -118,12 +178,43 @@ def safe_query(df: pd.DataFrame, code: str) -> str:
     safe_globals = {"__builtins__": SAFE_BUILTINS}
     safe_locals = {"df": df, "pd": pd, "np": np}
 
-    try:
-        result = eval(compile(tree, "<agent_query>", mode="eval"), safe_globals, safe_locals)
-    except Exception as e:
-        return f"Query failed with error: {type(e).__name__}: {e}"
+    if not _FORK_AVAILABLE:
+        # No fork on this platform (e.g. Windows): fall back to running
+        # inline. Still fully protected against code-injection by the AST
+        # checks above, just without the timeout/memory ceiling.
+        try:
+            result = eval(compile(tree, "<agent_query>", mode="eval"), safe_globals, safe_locals)
+        except Exception as e:
+            return f"Query failed with error: {type(e).__name__}: {e}"
+        result_str = _format_result(result)
+        if len(result_str) > MAX_RESULT_CHARS:
+            result_str = result_str[:MAX_RESULT_CHARS] + f"\n... [truncated, {len(result_str)} total chars]"
+        return result_str
 
-    result_str = _format_result(result)
+    ctx = mp.get_context("fork")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_run_isolated, args=(safe_globals, safe_locals, tree, child_conn))
+    proc.start()
+    child_conn.close()  # only the child writes to this end
+
+    proc.join(QUERY_TIMEOUT_SECONDS)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join()
+        return f"Query exceeded the {QUERY_TIMEOUT_SECONDS}s time limit and was terminated."
+
+    if parent_conn.poll():
+        status, payload = parent_conn.recv()
+    else:
+        # Process died without sending anything back — almost always the
+        # OS OOM-killer or the memory cap being hit hard enough to crash
+        # the process rather than raise a catchable MemoryError.
+        return "Query terminated unexpectedly, likely for exceeding the memory limit."
+
+    if status == "error":
+        return payload
+
+    result_str = payload
     if len(result_str) > MAX_RESULT_CHARS:
         result_str = result_str[:MAX_RESULT_CHARS] + f"\n... [truncated, {len(result_str)} total chars]"
     return result_str
@@ -160,3 +251,12 @@ if __name__ == "__main__":
             print(f"NOT BLOCKED (bug!): {q!r} -> {r}")
         except UnsafeQueryError as e:
             print(f"Blocked correctly: {q!r} -> {e}")
+
+    # Resource-exhaustion demo: syntactically safe, no AST rule objects to
+    # either of these, but both are computationally hostile. Timeout is
+    # lowered here just so this smoke test finishes quickly.
+    print("\n--- Resource-exhaustion guard (safe syntax, hostile computation) ---")
+    globals()["QUERY_TIMEOUT_SECONDS"] = 0.2  # lowered so this demo finishes quickly
+    print(safe_query(df, "sum(range(10**9))"))
+    globals()["QUERY_MEMORY_LIMIT_BYTES"] = 20 * 1024 * 1024  # 20 MB
+    print(safe_query(df, "np.zeros(10**8)"))  # ~800 MB, well over the cap

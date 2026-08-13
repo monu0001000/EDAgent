@@ -298,6 +298,27 @@ def test_sandbox_handles_runtime_errors_gracefully(small_df):
     result = safe_query(small_df, "df['nonexistent_column']")
     assert "error" in result.lower()
 
+# These two exercise the resource-exhaustion guard: expressions that pass
+# every AST safety check (no imports, no dunder access, nothing on the
+# blocklist) but are computationally hostile rather than malicious code.
+# Skipped where fork() isn't available (e.g. Windows), since that's the
+# only platform where the isolation itself is skipped too (see sandbox.py).
+import sandbox as _sandbox_module
+
+@pytest.mark.skipif(not _sandbox_module._FORK_AVAILABLE, reason="timeout/memory isolation requires fork()")
+def test_sandbox_kills_queries_that_exceed_the_time_limit(small_df, monkeypatch):
+    monkeypatch.setattr(_sandbox_module, "QUERY_TIMEOUT_SECONDS", 0.05)
+    # Syntactically fine, no AST rule objects to it — just slow enough to
+    # blow straight through a near-zero timeout.
+    result = safe_query(small_df, "sum(range(10**8))")
+    assert "time limit" in result.lower()
+
+@pytest.mark.skipif(not _sandbox_module._FORK_AVAILABLE, reason="timeout/memory isolation requires fork()")
+def test_sandbox_kills_queries_that_exceed_the_memory_limit(small_df, monkeypatch):
+    monkeypatch.setattr(_sandbox_module, "QUERY_MEMORY_LIMIT_BYTES", 20 * 1024 * 1024)  # 20 MB cap
+    result = safe_query(small_df, "np.zeros(10**8)")  # ~800 MB, well over the cap
+    assert "memory" in result.lower() or "terminated" in result.lower()
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
