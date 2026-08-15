@@ -65,7 +65,7 @@ def test_app_handles_csv_upload_end_to_end():
 def test_report_button_disabled_without_api_key(monkeypatch):
     """The Generate report button must be disabled when GROQ_API_KEY is
     not set, so a user can't click it and get a confusing API error."""
-    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_API_KEY", "")
 
     at = AppTest.from_file("streamlit_app.py")
     at.run(timeout=15)
