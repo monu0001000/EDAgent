@@ -251,7 +251,7 @@ def _run_tool_loop(
 
     Returns {"final_text": str, "tool_calls": [...], "iterations": int}.
     """
-    model = model or os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+    model = model or os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
     client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
     base_messages = [
@@ -328,8 +328,10 @@ def generate_insights_agentic(
     """
     Same interface and return shape as agent.generate_insights_agentic, but
     using Groq instead of Gemini. Model defaults to the GROQ_MODEL env var
-    if set, otherwise "llama-3.3-70b-versatile" — a strong general-purpose
-    model with tool-calling support on Groq's free tier.
+    if set, otherwise "openai/gpt-oss-120b" — OpenAI's open-weight MoE model
+    served on Groq's free tier, with tool-calling support. Migrated from
+    llama-3.3-70b-versatile after Groq deprecated it (Aug 16, 2026); see
+    README's model migration note if this needs to change again.
 
     max_iterations default raised from 5 to 7: with 5, a single failed
     query (e.g. calling .corr() on a non-numeric column) could burn the

@@ -43,8 +43,19 @@ cp .env.example .env
 
 Note: check Groq's current data-use policy if that matters for your use case. Fine for a
 portfolio project either way, just don't feed real sensitive data through the free tier.
-Defaults to `llama-3.3-70b-versatile`, overridable via `GROQ_MODEL` in `.env` if that model
+Defaults to `openai/gpt-oss-120b`, overridable via `GROQ_MODEL` in `.env` if that model
 ever runs out of quota or is deprecated.
+
+**Model migration note:** this project originally defaulted to `llama-3.3-70b-versatile`.
+Groq deprecated it (along with `llama-3.1-8b-instant`) on August 16, 2026 and recommended
+migrating to `openai/gpt-oss-120b` or `qwen/qwen3.6-27b`; this project moved to
+`openai/gpt-oss-120b`. Nothing else needed to change — Groq's tool-calling response shape
+(`tool_calls`, `message.content` for the final answer) is identical across their model
+lineup, so `groq_agent.py`'s tool loop didn't need any changes, only the model string. If
+you hit a `model_decommissioned` error on any Groq model in the future, check
+https://console.groq.com/docs/deprecations for the current recommended replacement and
+update `GROQ_MODEL` (or the default in `groq_agent.py`/`groq_insight_generator.py`)
+accordingly — Groq's model lineup changes faster than most providers'.
 
 ## Run the app
 

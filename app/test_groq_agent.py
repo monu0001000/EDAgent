@@ -142,7 +142,7 @@ def test_retry_succeeds_after_one_rate_limit(monkeypatch):
     final_response = _final_message("ok")
     mock_client.chat.completions.create.side_effect = [_rate_limit_error(), final_response]
 
-    result = _create_with_retry(mock_client, "llama-3.3-70b-versatile", [], [], verbose=False)
+    result = _create_with_retry(mock_client, "openai/gpt-oss-120b", [], [], verbose=False)
     assert result.choices[0].message.content == "ok"
     assert mock_client.chat.completions.create.call_count == 2
 
@@ -156,7 +156,7 @@ def test_retry_respects_retry_after_header(monkeypatch):
     final_response = _final_message("ok")
     mock_client.chat.completions.create.side_effect = [_rate_limit_error(retry_after=7), final_response]
 
-    _create_with_retry(mock_client, "llama-3.3-70b-versatile", [], [], verbose=False)
+    _create_with_retry(mock_client, "openai/gpt-oss-120b", [], [], verbose=False)
     assert sleep_calls == [7.0]
 
 def test_retry_gives_up_after_max_retries(monkeypatch):
@@ -166,7 +166,7 @@ def test_retry_gives_up_after_max_retries(monkeypatch):
     mock_client.chat.completions.create.side_effect = _rate_limit_error()
 
     with pytest.raises(RateLimitError):
-        _create_with_retry(mock_client, "llama-3.3-70b-versatile", [], [], max_retries=3, verbose=False)
+        _create_with_retry(mock_client, "openai/gpt-oss-120b", [], [], max_retries=3, verbose=False)
     assert mock_client.chat.completions.create.call_count == 3
 
 

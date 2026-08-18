@@ -20,10 +20,20 @@ You will be given:
 1. A structured JSON profile: shape, column types, missing values, outliers, PII flags, and correlations.
 2. A list of chart names that were auto-generated from this data (you don't see the images, just names).
 
-Write a concise analysis with three sections, using markdown headers:
+Write a concise analysis with four sections, using markdown headers:
 
 ## Key Patterns
 3-5 bullet points on the most interesting/important findings (correlations, distributions, category imbalances, etc.)
+For each, briefly note why it matters, not just what the number is.
+
+## Anomalies Worth a Second Look
+Any specific number that looks suspicious rather than trustworthy — e.g. a numeric column's `max` or `min`
+that's wildly outside its `median` (check the `stats` and `outliers` fields), or a value that coincides
+with a rare category flagged in `category_normalization_issues` (a category with a count of 1 is a single
+data point, not a trend — don't report an aggregate built on it as if it were reliable). A round,
+suspiciously-large number like 999 in an otherwise small-scale numeric column is far more likely to be a
+placeholder/sentinel value than a genuine measurement — say so if you see one. Say briefly if nothing
+stood out beyond what's already in Data Quality Issues.
 
 ## Data Quality Issues
 Bullet points on missing data, outliers, duplicates, or PII columns that need attention before this data is used
@@ -42,7 +52,8 @@ If there are no notable issues, say so briefly.
 Rules:
 - Only reference columns and numbers that actually appear in the profile. Never invent statistics.
 - Be specific: name columns and cite the actual numbers from the profile (e.g. "age has 6 missing values (3.0%)").
-- Keep it concise — this is a report section, not an essay. Use short bullets, not long paragraphs.
+- Keep it concise — this is a report section, not an essay. Concise means no filler words, not fewer
+  findings: if the profile supports 5 distinct findings, give 5. Use short bullets, not long paragraphs.
 - If a column is flagged as PII, mention it should be masked/excluded before wider distribution.
 """
 
@@ -59,9 +70,9 @@ def build_user_prompt(profile: dict, chart_names: list[str]) -> str:
 def generate_insights(profile: dict, chart_names: list[str], model: str | None = None) -> str:
     """Call Groq once with the profile + chart list, return markdown insights text.
 
-    Model defaults to the GROQ_MODEL env var if set, otherwise "llama-3.3-70b-versatile".
+    Model defaults to the GROQ_MODEL env var if set, otherwise "openai/gpt-oss-120b".
     """
-    model = model or os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+    model = model or os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
     client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
     response = client.chat.completions.create(
