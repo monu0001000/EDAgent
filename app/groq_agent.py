@@ -35,15 +35,35 @@ means across categories, or spot-checking rows that triggered an outlier flag.
 
 Use the tool when it would meaningfully sharpen your analysis — for example, breaking down a
 top-level number by a categorical column, or verifying a hypothesis about *why* a pattern exists.
-Do not use it just to re-fetch numbers already present in the profile. Call it at most 5 times, then
-write your final report.
+Do not use it just to re-fetch numbers already present in the profile. `.corr()` and other numeric
+pandas methods only work on numeric columns — check a column's `inferred_type` in the profile before
+querying it that way; if you want to relate a categorical column to a numeric one, use `.groupby()`
+instead. Call the tool at most 7 times, then write your final report. If a query returns an error,
+don't spend another call repeating the same mistake — either fix the specific problem (e.g. group by
+the categorical column instead of correlating it directly) or move on to a different question with
+your remaining calls.
+
+Before citing any groupby/aggregate result as a finding, sanity-check it against the profile: if the
+group it's based on is very small (e.g. a category with a count of 1 in `top_values`), or the
+aggregate is close to a value the profile already flagged as an outlier or a `category_normalization_issues`
+variant, say so explicitly rather than reporting it as a reliable pattern — a single-row average is
+not a trend. This matters most exactly when a number looks the most dramatic: a delay of "999 minutes"
+or similar sentinel-shaped value is far more likely to be a data-entry error than a real observation,
+and reporting it uncritically is worse than not reporting it at all.
 
 When you are done investigating, respond with your final analysis as markdown with these sections:
 
 ## Key Patterns
 3-5 bullet points on the most interesting findings, citing specific numbers. If a finding came from
 a tool query rather than the initial profile, make that clear (e.g. "Breaking this down by plan tier
-shows...").
+shows..."). For each bullet, briefly note why it matters, not just what the number is.
+
+## Anomalies Worth a Second Look
+Any specific number that looks suspicious rather than trustworthy — a value far outside the rest of
+the distribution, an aggregate driven by a single row, a group whose name is one of the
+`category_normalization_issues` variants of another group. Explain *why* it looks suspicious (e.g.
+"this group has only 1 row" or "this exact value looks like a placeholder/sentinel rather than a
+measurement"). Say briefly if nothing stood out beyond what's already in Data Quality Issues.
 
 ## Data Quality Issues
 Missing data, outliers, duplicates, or PII columns needing attention. Specifically check each column's
@@ -61,8 +81,44 @@ Say briefly if none are notable.
 
 Rules:
 - Never invent statistics — only cite numbers from the profile or from your own tool query results.
-- Be concise: short bullets, not paragraphs.
+- Be concise: short bullets, not paragraphs. Concise means no filler words, not fewer findings —
+  if the data supports 5 distinct findings, give 5, don't compress them into fewer bullets to save space.
 - Flag any PII columns as needing masking before wider distribution.
+"""
+
+QA_SYSTEM_PROMPT = """You are a data analyst answering one specific question about a dataset, asked
+by someone who has the structured profile below and a run_pandas_query tool for running read-only
+pandas expressions against the real dataframe (`df`).
+
+The dataset could be about anything — transactions, customers, trains, sensors, sales, patients,
+whatever the columns describe. Don't assume a domain; read the column names and the question to work
+out what's actually being asked, and answer using the columns that are actually present.
+
+Many questions ask you to make a call about ONE specific row or entity — "is train TRN1014 going to
+be late?", "will customer C-8842 churn?", "is transaction TXN-991 fraudulent?" are the same underlying
+task in every case. You cannot see the future and this dataset has no ground truth for what hasn't
+happened yet, so answer by finding the most relevant HISTORICAL evidence and reasoning from it, not by
+inventing a number:
+1. First, try to find the specific row(s) the question refers to — usually by filtering `df` on an ID
+   or name column.
+2. Then find comparable historical rows: same route/category/segment/group, similar conditions — and
+   look at the actual outcome distribution for those rows (e.g. groupby + mean/median/value_counts).
+3. Base your answer on that comparison, and state how many historical rows it's based on. If it's a
+   small number (say, under ~10), say so explicitly and hedge the answer accordingly — a pattern from
+   3 rows is a hint, not a prediction, and this dataset may only have a handful of rows total.
+4. If there's no reasonable historical comparison to make — the entity is completely novel, the ID
+   isn't in the data, or there's no relevant column to compare against — say that plainly instead of
+   guessing.
+
+Rules:
+- Never invent numbers — only cite figures from the profile or your own tool query results.
+- If a groupby/filter result relies on a value flagged elsewhere as a likely data-entry error (e.g. it
+  matches a `category_normalization_issues` variant, or looks like a sentinel/placeholder value), don't
+  base the answer on it without saying so — a single-row group is not a trend.
+- Structure: a direct answer first (1-2 sentences), then the evidence that supports it, then an
+  explicit confidence/caveat line (e.g. "based on 6 similar past records" or "low confidence: only 2
+  comparable rows exist").
+- Keep the whole answer under ~150 words. This is a direct answer to a question, not a full report.
 """
 
 TOOLS = [
@@ -143,6 +199,16 @@ def _build_initial_prompt(profile: dict) -> str:
     )
 
 
+def _build_question_prompt(profile: dict, question: str) -> str:
+    return (
+        "Here is the structured profile of the dataset:\n\n"
+        f"{json.dumps(profile, indent=2, default=str)}\n\n"
+        f'The user is asking: "{question}"\n\n'
+        "Use run_pandas_query to find the specific row(s) this question is about (if any) and "
+        "comparable historical rows, then answer."
+    )
+
+
 def _create_with_retry(client, model, messages, tools, max_retries: int = 4, verbose: bool = True, **kwargs):
     """Retry-with-backoff wrapper for Groq's RateLimitError. Respects the
     Retry-After response header when present, otherwise falls back to a
@@ -166,25 +232,31 @@ def _create_with_retry(client, model, messages, tools, max_retries: int = 4, ver
             delay = min(delay * 1.5, 45)
 
 
-def generate_insights_agentic(
+def _run_tool_loop(
     df: pd.DataFrame,
-    profile: dict,
-    model: str | None = None,
-    max_iterations: int = 5,
-    verbose: bool = True,
+    system_prompt: str,
+    initial_user_prompt: str,
+    model: str | None,
+    max_iterations: int,
+    verbose: bool,
 ) -> dict:
-    """
-    Same interface and return shape as agent.generate_insights_agentic, but
-    using Groq instead of Gemini. Model defaults to the GROQ_MODEL env var
-    if set, otherwise "llama-3.3-70b-versatile" — a strong general-purpose
-    model with tool-calling support on Groq's free tier.
+    """The actual agentic tool-calling loop, shared by every task that
+    needs "let the model run its own pandas queries against `df` before
+    answering" — currently generate_insights_agentic (writes a full
+    report) and answer_question (answers one specific question). Only the
+    system prompt and initial user message differ between tasks; the
+    message-history bookkeeping, tool execution, retry/backoff, and
+    forced-final-answer fallback are identical either way, so they live
+    here once instead of being copy-pasted per task.
+
+    Returns {"final_text": str, "tool_calls": [...], "iterations": int}.
     """
     model = model or os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
     client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
     base_messages = [
-        {"role": "system", "content": AGENT_SYSTEM_PROMPT},
-        {"role": "user", "content": _build_initial_prompt(profile)},
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": initial_user_prompt},
     ]
     iteration_history = []  # list of {"assistant_message", "tool_messages", "calls"}
     tool_call_log = []
@@ -199,7 +271,7 @@ def generate_insights_agentic(
         tool_calls = message.tool_calls or []
 
         if not tool_calls:
-            return {"report": message.content, "tool_calls": tool_call_log, "iterations": iteration}
+            return {"final_text": message.content, "tool_calls": tool_call_log, "iterations": iteration}
 
         tool_messages = []
         calls_this_iteration = []
@@ -234,15 +306,75 @@ def generate_insights_agentic(
     final_messages = _build_messages(base_messages, iteration_history)
     final_messages.append({
         "role": "system",
-        "content": "You have used all your tool calls. Write your final report now based on what you've learned.",
+        "content": "You have used all your tool calls. Give your final answer now based on what you've learned.",
     })
     response = _create_with_retry(
         client, model, final_messages, None, max_completion_tokens=3000, temperature=0.3, verbose=verbose,
     )
     return {
-        "report": response.choices[0].message.content,
+        "final_text": response.choices[0].message.content,
         "tool_calls": tool_call_log,
         "iterations": max_iterations,
+    }
+
+
+def generate_insights_agentic(
+    df: pd.DataFrame,
+    profile: dict,
+    model: str | None = None,
+    max_iterations: int = 7,
+    verbose: bool = True,
+) -> dict:
+    """
+    Same interface and return shape as agent.generate_insights_agentic, but
+    using Groq instead of Gemini. Model defaults to the GROQ_MODEL env var
+    if set, otherwise "llama-3.3-70b-versatile" — a strong general-purpose
+    model with tool-calling support on Groq's free tier.
+
+    max_iterations default raised from 5 to 7: with 5, a single failed
+    query (e.g. calling .corr() on a non-numeric column) could burn the
+    agent's last call and force it to write the final report having never
+    recovered from the mistake — observed in practice on a real messy
+    dataset, see README.
+    """
+    result = _run_tool_loop(
+        df, AGENT_SYSTEM_PROMPT, _build_initial_prompt(profile),
+        model, max_iterations, verbose,
+    )
+    return {
+        "report": result["final_text"],
+        "tool_calls": result["tool_calls"],
+        "iterations": result["iterations"],
+    }
+
+
+def answer_question(
+    df: pd.DataFrame,
+    profile: dict,
+    question: str,
+    model: str | None = None,
+    max_iterations: int = 6,
+    verbose: bool = True,
+) -> dict:
+    """
+    Answer a specific natural-language question about the dataset, e.g.
+    "is train TRN1014 going to be late?", "will customer C-8842 churn?",
+    "is transaction TXN-991 fraudulent?" — the same underlying task in
+    every case: find the specific entity, find comparable historical rows,
+    reason from the outcome distribution, state confidence based on how
+    much comparable history actually exists. Domain-agnostic by design —
+    see QA_SYSTEM_PROMPT; nothing here assumes what the columns mean.
+
+    Returns {"answer": str, "tool_calls": [...], "iterations": int}.
+    """
+    result = _run_tool_loop(
+        df, QA_SYSTEM_PROMPT, _build_question_prompt(profile, question),
+        model, max_iterations, verbose,
+    )
+    return {
+        "answer": result["final_text"],
+        "tool_calls": result["tool_calls"],
+        "iterations": result["iterations"],
     }
 
 

@@ -264,3 +264,57 @@ if st.button("Generate report", type="primary", disabled=not os.environ.get("GRO
                 st.error(f"Report generation failed: {e}")
                 st.stop()
         st.markdown(report)
+
+# ---------------------------------------------------------------------------
+# Ask a question — same agentic tool loop as the report, but aimed at one
+# specific question instead of a general investigation. Deliberately
+# domain-agnostic: works the same way whether the uploaded CSV is about
+# trains, customers, transactions, or anything else — see
+# groq_agent.QA_SYSTEM_PROMPT for how it decides what "comparable
+# historical rows" means for whatever columns are actually present.
+# ---------------------------------------------------------------------------
+
+st.markdown("### Ask a Question")
+st.caption(
+    "Ask about a specific row or a general pattern — e.g. \"is train going to be "
+    "late?\", \"will customer C-8842 churn?\", \"which category has the highest average spend?\". "
+    "The agent looks at comparable historical rows in your data and answers from that, stating "
+    "how much evidence it's actually based on."
+)
+
+if "qa_history" not in st.session_state:
+    st.session_state.qa_history = []
+
+question = st.text_input(
+    "Your question",
+    placeholder="e.g. is train TRN1014 going to be late?",
+    label_visibility="collapsed",
+    disabled=not os.environ.get("GROQ_API_KEY"),
+)
+
+if st.button("Ask", disabled=not os.environ.get("GROQ_API_KEY") or not question.strip()):
+    from groq_agent import answer_question
+
+    with st.spinner("Looking through the data..."):
+        try:
+            result = answer_question(df, profile, question, verbose=False)
+        except UnsafeQueryError as e:
+            st.error(f"Sandbox rejected a query unexpectedly: {e}")
+            st.stop()
+        except Exception as e:
+            st.error(f"Couldn't answer that: {e}")
+            st.stop()
+
+    st.session_state.qa_history.insert(0, {
+        "question": question,
+        "answer": result["answer"],
+        "tool_calls": result["tool_calls"],
+    })
+
+for qa in st.session_state.qa_history:
+    with st.container(border=True):
+        st.markdown(f"**Q: {qa['question']}**")
+        st.markdown(qa["answer"])
+        if qa["tool_calls"]:
+            with st.expander(f"Investigation log ({len(qa['tool_calls'])} quer{'y' if len(qa['tool_calls']) == 1 else 'ies'})"):
+                _render_log(qa["tool_calls"])

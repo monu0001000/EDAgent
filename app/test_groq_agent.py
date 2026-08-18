@@ -15,8 +15,8 @@ import pandas as pd
 import pytest
 
 from groq_agent import (
-    generate_insights_agentic, _create_with_retry,
-    _build_messages, KEEP_LAST_FULL_TURNS,
+    generate_insights_agentic, answer_question, _create_with_retry,
+    _build_messages, KEEP_LAST_FULL_TURNS, QA_SYSTEM_PROMPT,
 )
 from groq import RateLimitError
 
@@ -264,6 +264,77 @@ def test_end_to_end_message_count_plateaus_across_many_iterations(df, profile):
     # report now") — so it should be +1 versus the loop plateau, not
     # unboundedly larger.
     assert message_lengths[-1] == loop_lengths[-1] + 1
+
+
+# ---------------------------------------------------------------------------
+# answer_question: shares the same tool loop as generate_insights_agentic
+# (see _run_tool_loop), so these focus on the parts that differ: the
+# question gets into the prompt, and the return shape is {"answer", ...}
+# rather than {"report", ...}.
+# ---------------------------------------------------------------------------
+
+def test_answer_question_returns_answer_key_not_report(df, profile):
+    mock_response = _final_message("Yes, likely on time based on 5 similar past records.")
+
+    with patch("groq_agent.Groq") as MockClient:
+        MockClient.return_value.chat.completions.create.return_value = mock_response
+        result = answer_question(df, profile, "will it be on time?", verbose=False)
+
+    assert result["answer"] == "Yes, likely on time based on 5 similar past records."
+    assert "report" not in result
+    assert result["tool_calls"] == []
+    assert result["iterations"] == 0
+
+def test_answer_question_includes_the_question_in_the_prompt_sent_to_the_model(df, profile):
+    mock_response = _final_message("Based on the data, likely late.")
+    question = "is train TRN1014 going to be late?"
+
+    with patch("groq_agent.Groq") as MockClient:
+        mock_create = MockClient.return_value.chat.completions.create
+        mock_create.return_value = mock_response
+        answer_question(df, profile, question, verbose=False)
+
+    sent_messages = mock_create.call_args.kwargs["messages"]
+    user_message = next(m for m in sent_messages if m["role"] == "user")
+    assert question in user_message["content"]
+
+def test_answer_question_uses_qa_system_prompt_not_report_prompt(df, profile):
+    mock_response = _final_message("Some answer.")
+
+    with patch("groq_agent.Groq") as MockClient:
+        mock_create = MockClient.return_value.chat.completions.create
+        mock_create.return_value = mock_response
+        answer_question(df, profile, "some question?", verbose=False)
+
+    sent_messages = mock_create.call_args.kwargs["messages"]
+    system_message = next(m for m in sent_messages if m["role"] == "system")
+    assert system_message["content"] == QA_SYSTEM_PROMPT
+    assert "comparable historical rows" in system_message["content"]
+
+def test_answer_question_executes_tool_calls_same_as_report_mode(df, profile):
+    first_response = _tool_call_message("df[df['a'] == 3]")
+    second_response = _final_message("Found it: a=3 corresponds to row index 2.")
+
+    with patch("groq_agent.Groq") as MockClient:
+        mock_create = MockClient.return_value.chat.completions.create
+        mock_create.side_effect = [first_response, second_response]
+        result = answer_question(df, profile, "what row has a=3?", verbose=False)
+
+    assert len(result["tool_calls"]) == 1
+    assert result["tool_calls"][0]["expression"] == "df[df['a'] == 3]"
+    assert "row index 2" in result["answer"]
+
+def test_answer_question_respects_max_iterations_cap(df, profile):
+    looping_response = _tool_call_message("df['a'].sum()")
+    forced_final_response = _final_message("forced final answer")
+
+    with patch("groq_agent.Groq") as MockClient:
+        mock_create = MockClient.return_value.chat.completions.create
+        mock_create.side_effect = [looping_response] * 3 + [forced_final_response]
+        result = answer_question(df, profile, "some question?", max_iterations=2, verbose=False)
+
+    assert result["iterations"] == 2
+    assert "forced final answer" in result["answer"]
 
 
 if __name__ == "__main__":
