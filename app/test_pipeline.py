@@ -229,6 +229,22 @@ def test_profile_integration_catches_all_real_world_messy_data_issues():
     assert len(profile["columns"]["crowd"]["category_normalization_issues"]) == 1
     assert profile["columns"]["platform"]["mixed_numeric_text"]["non_numeric_examples"] == ["Two"]
 
+def test_duplicate_id_check_does_not_false_positive_on_continuous_numeric_columns():
+    """Regression test: found via the eval harness (evaluate.py). A
+    continuous float column can easily have a couple of coincidentally-
+    equal rounded values with no data-entry error involved — that's not
+    the same signal as a repeated identifier and shouldn't be flagged as
+    one."""
+    rng = np.random.default_rng(1)
+    n = 150
+    df = pd.DataFrame({
+        "customer_id": range(1, n + 1),  # genuinely unique — must NOT be flagged
+        "monthly_spend": rng.normal(50, 15, n).round(2),  # continuous — must NOT be flagged
+    })
+    profile = profile_dataframe(df)
+    assert "duplicate_id_values" not in profile["columns"]["customer_id"]
+    assert "duplicate_id_values" not in profile["columns"]["monthly_spend"]
+
 
 # ---------- Visualizer ----------
 

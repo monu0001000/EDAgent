@@ -273,18 +273,25 @@ def profile_dataframe(df: pd.DataFrame) -> dict:
                 col_info["mixed_numeric_text"] = mixed
 
         # Duplicate-value check: deliberately NOT gated behind col_type ==
-        # "id_like". detect_column_type requires >95% uniqueness to label a
-        # column id_like in the first place — but a duplicate is exactly
-        # what drops that ratio below the threshold, so gating this check
-        # behind the id_like label would make it unable to fire in the
-        # exact case it exists to catch (found via real-world testing: a
-        # duplicated train_id fell through to "text" classification and the
-        # duplicate went unreported). Instead, compute uniqueness directly
-        # here and apply a looser threshold — high-but-not-perfect
-        # uniqueness is itself the signal that a column was probably
-        # intended to be a unique key.
+        # "id_like" specifically. detect_column_type requires >95%
+        # uniqueness to label a column id_like in the first place — but a
+        # duplicate is exactly what drops that ratio below the threshold,
+        # so gating this check behind the id_like label alone would make
+        # it unable to fire in the exact case it exists to catch (found
+        # via real-world testing: a duplicated train_id fell through to
+        # "categorical"/"text" classification and the duplicate went
+        # unreported). It IS gated behind col_type being one of
+        # ("id_like", "categorical", "text") — i.e. columns that plausibly
+        # represent discrete identifiers/labels rather than continuous
+        # measurements. Found via the eval harness (evaluate.py): without
+        # this restriction, a "numeric" float column like monthly_spend
+        # got flagged as having a "duplicate ID" whenever rounding
+        # happened to produce a couple of coincidentally-equal values —
+        # completely expected noise in a continuous measurement, not a
+        # data-entry error, and not something a real identifier column
+        # would ever be confused with.
         non_null = series.dropna()
-        if len(non_null) > 0 and col_type != "empty":
+        if len(non_null) > 0 and col_type in ("id_like", "categorical", "text"):
             uniqueness_ratio = non_null.nunique() / len(non_null)
             if uniqueness_ratio > 0.8:
                 dup_info = detect_duplicate_id_values(series)
