@@ -26,7 +26,7 @@ Runs entirely on **Groq's free API tier** (no credit card, no cost) — see Setu
 | Streamlit UI | `app/streamlit_app.py` | ✅ Done, tested |
 | Evaluation harness | `app/evaluate.py`, `app/eval_datasets.py` | ✅ Done, tested — scores reports against profiler ground truth |
 
-**92/92 tests passing** across `test_pipeline.py`, `test_groq_agent.py`, `test_streamlit_app.py`, `test_evaluate.py`.
+**95/95 tests passing** across `test_pipeline.py`, `test_groq_agent.py`, `test_streamlit_app.py`, `test_evaluate.py`.
 
 ## Setup
 
@@ -49,13 +49,29 @@ ever runs out of quota or is deprecated.
 **Model migration note:** this project originally defaulted to `llama-3.3-70b-versatile`.
 Groq deprecated it (along with `llama-3.1-8b-instant`) on August 16, 2026 and recommended
 migrating to `openai/gpt-oss-120b` or `qwen/qwen3.6-27b`; this project moved to
-`openai/gpt-oss-120b`. Nothing else needed to change — Groq's tool-calling response shape
-(`tool_calls`, `message.content` for the final answer) is identical across their model
-lineup, so `groq_agent.py`'s tool loop didn't need any changes, only the model string. If
-you hit a `model_decommissioned` error on any Groq model in the future, check
-https://console.groq.com/docs/deprecations for the current recommended replacement and
-update `GROQ_MODEL` (or the default in `groq_agent.py`/`groq_insight_generator.py`)
-accordingly — Groq's model lineup changes faster than most providers'.
+`openai/gpt-oss-120b`. Groq's tool-calling response shape (`tool_calls`, `message.content`
+for the final answer) is identical across their model lineup, so `groq_agent.py`'s tool
+loop didn't need structural changes for the swap — but the new model did surface one real
+quirk live in production: when the agent hits its iteration cap, the forced-final-answer
+request deliberately sends `tools=None` so the model can't just keep investigating forever.
+`gpt-oss-120b` sometimes tries to call a tool anyway despite that, and Groq's API rejects
+the *entire response* with a 400 (`tool_use_failed`, "Tool choice is none, but model called
+a tool") rather than just ignoring the attempted call — this crashed report/question
+generation outright the first time it happened (mid-investigation of a specific train ID in
+the real commuter dataset). Fixed in `groq_agent.py`: the tool call the model wanted to
+make is still recoverable from the error body's `failed_generation` field, so instead of
+surfacing the raw 400, that one query now actually gets run, its result gets fed back, and
+the model is asked again — it accepts the answer at that point almost every time, since the
+thing it wanted to check has now actually been checked. If it insists a second time, the
+code gives up gracefully and returns a summary of whatever the investigation already found,
+rather than crashing the whole report. Covered by `test_agent_recovers_from_forced_final_tool_use_error`,
+`test_agent_falls_back_gracefully_if_forced_final_error_repeats`, and
+`test_agent_reraises_unrelated_bad_request_errors` (confirming an unrelated 400, e.g. a bad
+API key, still surfaces normally rather than being silently swallowed by this recovery path).
+If you hit a `model_decommissioned` error on any Groq model in the future, check
+https://console.groq.com/docs/deprecations for the current recommended replacement — but
+also actually exercise the agentic loop against the new model before assuming the swap is
+risk-free, since a model migration on Groq isn't guaranteed to be purely a string change.
 
 ## Run the app
 
@@ -85,7 +101,7 @@ python3 groq_insight_generator.py   # single-shot report — needs GROQ_API_KEY
 python3 groq_agent.py               # agentic report — needs GROQ_API_KEY, watch it investigate
 python3 evaluate.py                 # evaluation harness — needs GROQ_API_KEY, see Evaluation below
 
-python3 -m pytest -v                # full test suite (92 tests)
+python3 -m pytest -v                # full test suite (95 tests)
 ```
 
 ## Architecture
@@ -330,5 +346,5 @@ query result — is a natural next step.
 - Achieved flat LLM token usage regardless of dataset size by sending only aggregated
   profile statistics, never raw rows, to the model.
 - Shipped a Streamlit UI with headless integration tests (Streamlit `AppTest`) covering the
-  full upload-to-report flow, reaching 92 passing tests across the project, enforced on
+  full upload-to-report flow, reaching 95 passing tests across the project, enforced on
   every push via GitHub Actions CI.

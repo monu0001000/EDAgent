@@ -10,6 +10,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(__file__))
 
+import json
 from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
@@ -18,7 +19,7 @@ from groq_agent import (
     generate_insights_agentic, answer_question, _create_with_retry,
     _build_messages, KEEP_LAST_FULL_TURNS, QA_SYSTEM_PROMPT,
 )
-from groq import RateLimitError
+from groq import RateLimitError, BadRequestError
 
 
 def _final_message(text):
@@ -103,6 +104,85 @@ def test_agent_respects_max_iterations_cap(df, profile):
     assert result["iterations"] == 3
     assert len(result["tool_calls"]) == 4
     assert "forced final answer" in result["report"]
+
+# ---------------------------------------------------------------------------
+# Recovering from gpt-oss-120b's "tool_use_failed" quirk: it sometimes tries
+# to call a tool even on the forced-final-answer request where tools=None
+# is deliberately sent to prevent exactly that. Groq's API rejects the whole
+# response with a 400 rather than ignoring the attempted call. Real example
+# hit in production: "Tool choice is none, but model called a tool" while
+# investigating a specific train_id. See _parse_forced_tool_call_from_error.
+# ---------------------------------------------------------------------------
+
+def _tool_use_failed_error(expression: str):
+    body = {
+        "error": {
+            "message": "Tool choice is none, but model called a tool",
+            "type": "invalid_request_error",
+            "code": "tool_use_failed",
+            "failed_generation": json.dumps({"name": "run_pandas_query", "arguments": {"expression": expression}}),
+        }
+    }
+    resp = MagicMock()
+    resp.request = MagicMock()
+    return BadRequestError("Error code: 400", response=resp, body=body)
+
+def test_agent_recovers_from_forced_final_tool_use_error(df, profile):
+    looping_response = _tool_call_message("df['a'].sum()")
+    real_final_response = _final_message("## Key Patterns\n- a sums to 15, checked b too")
+
+    with patch("groq_agent.Groq") as MockClient:
+        mock_create = MockClient.return_value.chat.completions.create
+        # 4 looping tool-call rounds (max_iterations=3), then the forced-final
+        # request fails with the recoverable error, then succeeds once the
+        # recovered query has actually been run.
+        mock_create.side_effect = (
+            [looping_response] * 4 + [_tool_use_failed_error("df['b'].unique()")] + [real_final_response]
+        )
+        result = generate_insights_agentic(df, profile, max_iterations=3, verbose=False)
+
+    # 4 original tool calls + 1 recovered one from the failed forced-final attempt
+    assert len(result["tool_calls"]) == 5
+    assert result["tool_calls"][-1]["expression"] == "df['b'].unique()"
+    assert "a sums to 15, checked b too" in result["report"]
+
+def test_agent_falls_back_gracefully_if_forced_final_error_repeats(df, profile):
+    looping_response = _tool_call_message("df['a'].sum()")
+
+    with patch("groq_agent.Groq") as MockClient:
+        mock_create = MockClient.return_value.chat.completions.create
+        # Both forced-final attempts fail the same way — should not raise,
+        # should fall back to summarizing what's already in tool_call_log.
+        mock_create.side_effect = (
+            [looping_response] * 4
+            + [_tool_use_failed_error("df['b'].unique()")]
+            + [_tool_use_failed_error("df['c'].unique()")]
+        )
+        result = generate_insights_agentic(df, profile, max_iterations=3, verbose=False)
+
+    assert "couldn't produce a final written answer" in result["report"]
+    assert "df['a'].sum()" in result["report"]  # summarized from tool_call_log
+
+def test_agent_reraises_unrelated_bad_request_errors(df, profile):
+    """Only the specific tool_use_failed/run_pandas_query shape is treated
+    as recoverable — an unrelated 400 (bad API key, malformed request,
+    etc.) should still surface as a real error rather than being silently
+    swallowed by the recovery path."""
+    looping_response = _tool_call_message("df['a'].sum()")
+    unrelated_error = BadRequestError(
+        "Error code: 400",
+        response=MagicMock(request=MagicMock()),
+        body={"error": {"message": "invalid api key", "code": "invalid_api_key"}},
+    )
+
+    with patch("groq_agent.Groq") as MockClient:
+        mock_create = MockClient.return_value.chat.completions.create
+        mock_create.side_effect = [looping_response] * 4 + [unrelated_error]
+        result = generate_insights_agentic(df, profile, max_iterations=3, verbose=False)
+
+    # Not the recoverable shape -> breaks out of the grace loop immediately
+    # and falls back gracefully rather than retrying pointlessly or crashing.
+    assert "couldn't produce a final written answer" in result["report"]
 
 def test_agent_appends_tool_role_message_with_correct_id(df, profile):
     """Verify the message list sent on the second call includes a

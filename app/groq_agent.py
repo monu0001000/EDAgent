@@ -19,7 +19,7 @@ import json
 import time
 import pandas as pd
 from dotenv import load_dotenv
-from groq import Groq, RateLimitError
+from groq import Groq, RateLimitError, BadRequestError
 
 from sandbox import safe_query, UnsafeQueryError
 
@@ -232,6 +232,83 @@ def _create_with_retry(client, model, messages, tools, max_retries: int = 4, ver
             delay = min(delay * 1.5, 45)
 
 
+def _execute_tool_calls(df: pd.DataFrame, tool_calls, tool_call_log: list, verbose: bool) -> tuple[list, list]:
+    """Run each requested tool call through the sandbox, logging every one
+    to tool_call_log (for the investigation-log UI) and returning both the
+    role="tool" messages to append to the conversation AND the plain
+    {expression, result} records _compact_summary_message needs later.
+    Shared by the main loop and the forced-final-answer grace handling
+    below, so a tool call is always executed and logged the same way
+    regardless of which branch triggered it."""
+    tool_messages = []
+    calls = []
+    for tc in tool_calls:
+        try:
+            args = json.loads(tc.function.arguments)
+        except json.JSONDecodeError:
+            args = {}
+        expression = args.get("expression", "")
+        if verbose:
+            print(f"[agent] running query: {expression}")
+        try:
+            result = safe_query(df, expression)
+        except UnsafeQueryError as e:
+            result = f"Query rejected for safety reasons: {e}"
+
+        tool_call_log.append({"expression": expression, "result": result})
+        calls.append({"expression": expression, "result": result})
+        tool_messages.append({
+            "role": "tool",
+            "tool_call_id": tc.id,
+            "content": result,
+        })
+    return tool_messages, calls
+
+
+def _parse_forced_tool_call_from_error(error: BadRequestError):
+    """gpt-oss-120b (and possibly other reasoning models) occasionally
+    tries to call a tool even on a request where tools have been removed
+    specifically to force a final text answer — Groq's API then rejects
+    the whole response with a 400 tool_use_failed error rather than just
+    ignoring the attempted call. The tool call the model wanted to make is
+    still recoverable from the error body's `failed_generation` field, so
+    rather than surface a raw 400 to the user, we can execute that one
+    query for real, feed the result back, and ask again — the model
+    almost always accepts the answer at that point since the thing it
+    wanted to check has now actually been checked.
+
+    Returns a tool_calls-shaped list (matching what message.tool_calls
+    normally looks like) if the error is this specific, recoverable shape,
+    else None."""
+    body = getattr(error, "body", None)
+    if not isinstance(body, dict):
+        return None
+    err = body.get("error", {})
+    if err.get("code") != "tool_use_failed":
+        return None
+    raw = err.get("failed_generation")
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if parsed.get("name") != "run_pandas_query":
+        return None
+
+    class _RecoveredToolCall:
+        """Minimal stand-in for the SDK's tool_call object — just enough
+        shape (`.id`, `.function.name`, `.function.arguments`) for
+        _execute_tool_calls and the message-history bookkeeping to treat
+        it exactly like a real one."""
+        def __init__(self, arguments: str):
+            self.id = "recovered_call_1"
+            self.function = type("_F", (), {"name": "run_pandas_query", "arguments": arguments})()
+
+    args = parsed.get("arguments", {})
+    return [_RecoveredToolCall(json.dumps(args) if not isinstance(args, str) else args)]
+
+
 def _run_tool_loop(
     df: pd.DataFrame,
     system_prompt: str,
@@ -273,49 +350,63 @@ def _run_tool_loop(
         if not tool_calls:
             return {"final_text": message.content, "tool_calls": tool_call_log, "iterations": iteration}
 
-        tool_messages = []
-        calls_this_iteration = []
-        for tc in tool_calls:
-            try:
-                args = json.loads(tc.function.arguments)
-            except json.JSONDecodeError:
-                args = {}
-            expression = args.get("expression", "")
-            if verbose:
-                print(f"[agent] running query: {expression}")
-            try:
-                result = safe_query(df, expression)
-            except UnsafeQueryError as e:
-                result = f"Query rejected for safety reasons: {e}"
-
-            tool_call_log.append({"expression": expression, "result": result})
-            calls_this_iteration.append({"expression": expression, "result": result})
-            tool_messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result,
-            })
-
+        tool_messages, calls = _execute_tool_calls(df, tool_calls, tool_call_log, verbose)
         iteration_history.append({
             "assistant_message": message,
             "tool_messages": tool_messages,
-            "calls": calls_this_iteration,
+            "calls": calls,
         })
 
-    # Forced final answer if we ran out of iterations
+    # Forced final answer if we ran out of iterations. Tools are
+    # deliberately omitted (tools=None) so the model can't just keep
+    # investigating forever — but gpt-oss-120b sometimes tries to call one
+    # anyway despite that, which Groq's API rejects outright as a 400
+    # rather than silently ignoring. Recover from that specific case once:
+    # actually run the query it wanted, feed the result back, then ask
+    # again. If it insists a second time, give up gracefully with
+    # whatever's already been found rather than raising.
     final_messages = _build_messages(base_messages, iteration_history)
     final_messages.append({
         "role": "system",
         "content": "You have used all your tool calls. Give your final answer now based on what you've learned.",
     })
-    response = _create_with_retry(
-        client, model, final_messages, None, max_completion_tokens=3000, temperature=0.3, verbose=verbose,
-    )
-    return {
-        "final_text": response.choices[0].message.content,
-        "tool_calls": tool_call_log,
-        "iterations": max_iterations,
-    }
+
+    for grace_attempt in range(2):
+        try:
+            response = _create_with_retry(
+                client, model, final_messages, None, max_completion_tokens=3000, temperature=0.3, verbose=verbose,
+            )
+            return {
+                "final_text": response.choices[0].message.content,
+                "tool_calls": tool_call_log,
+                "iterations": max_iterations,
+            }
+        except BadRequestError as e:
+            recovered_tool_calls = _parse_forced_tool_call_from_error(e)
+            if recovered_tool_calls is None or grace_attempt == 1:
+                break  # not the recoverable case, or already tried once — stop retrying
+            if verbose:
+                print("[agent] model tried one more tool call while being forced to finish — running it, then asking again")
+            tool_messages, _calls = _execute_tool_calls(df, recovered_tool_calls, tool_call_log, verbose)
+            # The model's own "assistant" turn that requested this call was
+            # never actually returned to us (the request that contained it
+            # got rejected), so there's no real assistant message to log
+            # here — just the tool result, appended directly as context for
+            # the next attempt.
+            final_messages.extend(tool_messages)
+
+    # Both attempts failed (or the error wasn't the recoverable shape) —
+    # rather than crash the whole report/answer on what the model's own
+    # investigation already turned up, summarize from tool_call_log.
+    if tool_call_log:
+        fallback_lines = "\n".join(f"- `{tc['expression']}` → {tc['result'][:200]}" for tc in tool_call_log)
+        fallback_text = (
+            "The model couldn't produce a final written answer after its investigation "
+            f"(hit an API error while wrapping up), but here's what it found:\n\n{fallback_lines}"
+        )
+    else:
+        fallback_text = "The model couldn't produce an answer due to a repeated API error, and hadn't run any queries yet."
+    return {"final_text": fallback_text, "tool_calls": tool_call_log, "iterations": max_iterations}
 
 
 def generate_insights_agentic(
