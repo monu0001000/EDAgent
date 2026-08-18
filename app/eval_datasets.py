@@ -20,8 +20,10 @@ scores against the same data.
 
 import numpy as np
 import pandas as pd
+from pathlib import Path
 
 SEED = 42
+DATA_DIR = Path(__file__).parent.parent / "data"
 
 
 def _messy_categories_df() -> pd.DataFrame:
@@ -123,11 +125,25 @@ def _clean_df() -> pd.DataFrame:
     })
 
 
+def _real_messy_commuter_df() -> pd.DataFrame | None:
+    """The actual real-world messy dataset referenced throughout the
+    README (station-name whitespace/case variants, a duplicated train_id,
+    an invalid "25:00" departure time, a mixed numeric/text platform
+    column, and a 999-minute sentinel delay value hiding inside a
+    single-row 'MEDIUM' crowd_status category). Loaded from disk rather
+    than generated, so it's optional: returns None if the file isn't
+    present rather than failing the whole eval run over one missing case."""
+    path = DATA_DIR / "local_train_commuter_data.csv"
+    if not path.exists():
+        return None
+    return pd.read_csv(path)
+
+
 def get_eval_cases() -> list[dict]:
     """Returns the fixed set of {"name", "description", "df"} evaluation
     cases. `evaluate.py` computes ground truth for each by profiling `df`
     directly — this module only owns the data, not the answer key."""
-    return [
+    cases = [
         {
             "name": "messy_categories",
             "description": "A 'city' column with whitespace/case variants of the same value.",
@@ -159,6 +175,20 @@ def get_eval_cases() -> list[dict]:
             "df": _clean_df(),
         },
     ]
+
+    real_df = _real_messy_commuter_df()
+    if real_df is not None:
+        cases.append({
+            "name": "real_messy_commuter_data",
+            "description": (
+                "The real-world messy dataset that originally motivated profiler.py's "
+                "deterministic checks — every issue class in one 25-row file, including a "
+                "999-minute sentinel value hiding inside a single-row 'MEDIUM' category."
+            ),
+            "df": real_df,
+        })
+
+    return cases
 
 
 if __name__ == "__main__":

@@ -276,7 +276,7 @@ if st.button("Generate report", type="primary", disabled=not os.environ.get("GRO
 
 st.markdown("### Ask a Question")
 st.caption(
-    "Ask about a specific row or a general pattern — e.g. \"is train going to be "
+    "Ask about a specific row or a general pattern — e.g. \"is train TRN1014 going to be "
     "late?\", \"will customer C-8842 churn?\", \"which category has the highest average spend?\". "
     "The agent looks at comparable historical rows in your data and answers from that, stating "
     "how much evidence it's actually based on."

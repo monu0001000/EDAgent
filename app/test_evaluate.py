@@ -106,3 +106,19 @@ def test_eval_cases_produce_a_valid_ground_truth_shape(case):
     gt = extract_ground_truth(profile)
     assert isinstance(gt["flagged_columns"], dict)
     assert isinstance(gt["correlated_pairs"], list)
+
+def test_real_messy_commuter_data_case_is_loaded():
+    """The real_messy_commuter_data case is optional (skipped if the CSV
+    isn't present — see eval_datasets.py), but if it IS present, it should
+    actually flag every issue class it's meant to demonstrate."""
+    cases = {c["name"]: c for c in get_eval_cases()}
+    if "real_messy_commuter_data" not in cases:
+        pytest.skip("data/local_train_commuter_data.csv not present")
+
+    profile = profile_dataframe(cases["real_messy_commuter_data"]["df"])
+    gt = extract_ground_truth(profile)
+    assert "category_normalization" in gt["flagged_columns"].get("station_from", [])
+    assert "category_normalization" in gt["flagged_columns"].get("crowd_status", [])
+    assert "duplicate_id" in gt["flagged_columns"].get("train_id", [])
+    assert "mixed_numeric_text" in gt["flagged_columns"].get("platform", [])
+    assert "unparseable_datetime" in gt["flagged_columns"].get("scheduled_departure", [])

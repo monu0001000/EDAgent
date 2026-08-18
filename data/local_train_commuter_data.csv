@@ -1,0 +1,26 @@
+train_id,station_from,station_to,scheduled_departure,actual_departure,delay_minutes,crowd_status,platform
+TRN1000,Churchgate,Borivali,08:00,08:02,2.0,High,1
+TRN1001,CSMT,Kalyan,08:15,08:15,0.0,Medium,2
+TRN1002,Dadar,Virar,08:30,08:45,15.0,Very High,3
+TRN1003,  Bandra  ,Andheri,09:00,09:00,0.0,Low,1
+TRN1004,Andheri,Goregaon,09:12,,,High,Two
+TRN1005,Borivali,Churchgate,10:05,10:10,5.0,Medium,4
+TRN1006,Thane,CSMT,18:30,18:55,25.0,Crush Load,1
+TRN1007,Kalyan,Thna,19:00,19:00,0.0,Low,2
+TRN1008,Churchgate,Borivali,08:00,08:02,-5.0,high,1
+TRN1009,CSMT,Kalyan,08:15,08:15,999.0,MEDIUM,2
+TRN1010,Dadar,Virar,08:30,08:45,12.0,,3
+TRN1011,Bandra,Andheri,09:00,09:00,0.0,Low,1
+TRN-1012,Andheri,Goregaon,09:12,,,High,4
+TRN1013,Borivali,Churchgate,10:05,10:10,3.0,Medium,5
+TRN1014,Thane,CSMT,18:30,18:55,40.0,High,1
+TRN1014,Kalyan,Thane,19:00,19:00,0.0,Low,2
+TRN1016,Churchgate,Borivali,08:00,08:02,2.0,High,1
+TRN1017,CSMT,Kalyan,08:15,08:15,0.0,Medium,2
+TRN1018,Dadar,Virar,08:30,08:45,10.0,Extreme,3
+TRN1019,Bandra,Andheri,09:00,09:00,0.0,Low,1
+TRN1020,Andheri,Goregaon,09:12,,,High,4
+TRN1021,Borivali,Churchgate,10:05,10:10,8.0,Medium,5
+TRN1022,Thane,CSMT,18:30,18:55,30.0,High,1
+TRN1023,Kalyan,Thane,19:00,19:00,0.0,Low,2
+TRN1024,CSMT,Dadar,25:00,00:15,15.0,Medium,1
