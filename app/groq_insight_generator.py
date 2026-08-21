@@ -73,7 +73,7 @@ def generate_insights(profile: dict, chart_names: list[str], model: str | None =
     Model defaults to the GROQ_MODEL env var if set, otherwise "openai/gpt-oss-120b".
     """
     model = model or os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
-    client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    client = Groq(api_key=os.environ.get("GROQ_API_KEY"), timeout=45.0)
 
     response = client.chat.completions.create(
         model=model,

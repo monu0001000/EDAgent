@@ -153,6 +153,15 @@ TOOLS = [
 # "tool" role message per call), and the full text of every past result
 # gets re-sent on every subsequent API call.
 KEEP_LAST_FULL_TURNS = 2
+
+# Extra rounds, after max_iterations is exhausted, where the model is
+# strongly told to stop investigating and answer — but tools stay
+# technically available so a tool call it insists on making anyway just
+# succeeds normally instead of triggering the tool_use_failed error that
+# happens when tools are stripped to None (see _parse_forced_tool_call_
+# from_error). Only after these also produce another tool call do we fall
+# back to the harder tools=None cutoff.
+WRAP_UP_ROUNDS = 2
 SUMMARY_RESULT_CHARS = 150
 
 
@@ -212,7 +221,21 @@ def _build_question_prompt(profile: dict, question: str) -> str:
 def _create_with_retry(client, model, messages, tools, max_retries: int = 4, verbose: bool = True, **kwargs):
     """Retry-with-backoff wrapper for Groq's RateLimitError. Respects the
     Retry-After response header when present, otherwise falls back to a
-    fixed delay."""
+    fixed delay.
+
+    Defaults reasoning_effort to "low" specifically for gpt-oss models
+    (unless already set via kwargs): they're reasoning models that spend
+    real time "thinking" before answering even for a straightforward
+    "which groupby should I run next" decision, and with up to
+    max_iterations + WRAP_UP_ROUNDS calls in a single investigation, that
+    adds up — a real deployed run against a 7-column sales dataset visibly
+    dragged. Gated to gpt-oss specifically (rather than applied
+    unconditionally) since reasoning_effort isn't a universally-supported
+    parameter — passing it to a model that doesn't recognize it risks a
+    400 on any GROQ_MODEL override that isn't a gpt-oss variant."""
+    if "gpt-oss" in model and "reasoning_effort" not in kwargs:
+        kwargs["reasoning_effort"] = "low"
+
     delay = 10
     for attempt in range(max_retries):
         try:
@@ -329,7 +352,7 @@ def _run_tool_loop(
     Returns {"final_text": str, "tool_calls": [...], "iterations": int}.
     """
     model = model or os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
-    client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    client = Groq(api_key=os.environ.get("GROQ_API_KEY"), timeout=45.0)
 
     base_messages = [
         {"role": "system", "content": system_prompt},
@@ -357,14 +380,52 @@ def _run_tool_loop(
             "calls": calls,
         })
 
-    # Forced final answer if we ran out of iterations. Tools are
-    # deliberately omitted (tools=None) so the model can't just keep
-    # investigating forever — but gpt-oss-120b sometimes tries to call one
-    # anyway despite that, which Groq's API rejects outright as a 400
-    # rather than silently ignoring. Recover from that specific case once:
-    # actually run the query it wanted, feed the result back, then ask
-    # again. If it insists a second time, give up gracefully with
-    # whatever's already been found rather than raising.
+    # Ran out of iterations. First, give the model up to WRAP_UP_ROUNDS
+    # extra chances to answer in plain text while tools STAY available
+    # (just with a strong "stop investigating, answer now" instruction).
+    # This is deliberately different from immediately stripping tools to
+    # None: gpt-oss-120b doesn't always respect a hard "no tools" removal
+    # (see _parse_forced_tool_call_from_error below) and gets a real 400
+    # error when it tries anyway — but if tools are still technically
+    # available, a tool call it insists on making just succeeds normally,
+    # bounded to a couple of extra rounds rather than crashing outright.
+    # This fixed a real case where investigating a 7-column sales dataset
+    # ran the model out of patience for one more round of synthesis and it
+    # kept reaching for the tool instead of writing the report.
+    for _wrap_up_round in range(WRAP_UP_ROUNDS):
+        messages = _build_messages(base_messages, iteration_history)
+        messages.append({
+            "role": "system",
+            "content": (
+                "You have used your full investigation budget. Do not call any more tools — "
+                "write your final answer now as plain text, based on everything you've already found."
+            ),
+        })
+        response = _create_with_retry(
+            client, model, messages, TOOLS,
+            max_completion_tokens=3000, temperature=0.3, verbose=verbose,
+        )
+        message = response.choices[0].message
+        tool_calls = message.tool_calls or []
+
+        if not tool_calls:
+            return {"final_text": message.content, "tool_calls": tool_call_log, "iterations": max_iterations}
+
+        tool_messages, calls = _execute_tool_calls(df, tool_calls, tool_call_log, verbose)
+        iteration_history.append({
+            "assistant_message": message,
+            "tool_messages": tool_messages,
+            "calls": calls,
+        })
+
+    # Absolute last resort: strip tools entirely. Tools are deliberately
+    # omitted (tools=None) so the model can't just keep investigating
+    # forever — but gpt-oss-120b sometimes tries to call one anyway
+    # despite that, which Groq's API rejects outright as a 400 rather than
+    # silently ignoring. Recover from that specific case once: actually
+    # run the query it wanted, feed the result back, then ask again. If it
+    # insists a second time, give up gracefully with whatever's already
+    # been found rather than raising.
     final_messages = _build_messages(base_messages, iteration_history)
     final_messages.append({
         "role": "system",
@@ -395,7 +456,7 @@ def _run_tool_loop(
             # the next attempt.
             final_messages.extend(tool_messages)
 
-    # Both attempts failed (or the error wasn't the recoverable shape) —
+    # Every attempt failed (or the error wasn't the recoverable shape) —
     # rather than crash the whole report/answer on what the model's own
     # investigation already turned up, summarize from tool_call_log.
     if tool_call_log:

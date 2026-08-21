@@ -92,6 +92,28 @@ def test_agent_rejects_unsafe_query_but_continues_loop(df, profile):
 
     assert "rejected" in result["tool_calls"][0]["result"].lower()
 
+def test_reasoning_effort_defaults_to_low_for_gpt_oss_models(df, profile):
+    final_response = _final_message("done")
+
+    with patch("groq_agent.Groq") as MockClient:
+        mock_create = MockClient.return_value.chat.completions.create
+        mock_create.return_value = final_response
+        generate_insights_agentic(df, profile, model="openai/gpt-oss-120b", verbose=False)
+
+    assert mock_create.call_args.kwargs["reasoning_effort"] == "low"
+
+def test_reasoning_effort_not_forced_on_non_gpt_oss_models(df, profile):
+    """Gated to gpt-oss specifically — passing reasoning_effort to a model
+    that doesn't support it risks a 400 on any GROQ_MODEL override."""
+    final_response = _final_message("done")
+
+    with patch("groq_agent.Groq") as MockClient:
+        mock_create = MockClient.return_value.chat.completions.create
+        mock_create.return_value = final_response
+        generate_insights_agentic(df, profile, model="llama-3.1-8b-instant", verbose=False)
+
+    assert "reasoning_effort" not in mock_create.call_args.kwargs
+
 def test_agent_respects_max_iterations_cap(df, profile):
     looping_response = _tool_call_message("df['a'].sum()")
     forced_final_response = _final_message("## Key Patterns\n- forced final answer")
@@ -127,22 +149,46 @@ def _tool_use_failed_error(expression: str):
     resp.request = MagicMock()
     return BadRequestError("Error code: 400", response=resp, body=body)
 
+def test_agent_answers_during_wrap_up_round_instead_of_needing_tools_stripped(df, profile):
+    """The core fix for a real production case: if the model is still
+    insisting on tool calls right when max_iterations runs out, give it
+    WRAP_UP_ROUNDS extra chances with tools still technically available
+    (so a tool call, if it insists, just succeeds normally) rather than
+    immediately stripping tools and risking the tool_use_failed error.
+    This should resolve with a real written answer, not the raw-dump
+    fallback — this is what was missing before WRAP_UP_ROUNDS existed."""
+    looping_response = _tool_call_message("df['a'].sum()")
+    wrap_up_success = _final_message("## Key Patterns\n- synthesized after wrap-up")
+
+    with patch("groq_agent.Groq") as MockClient:
+        mock_create = MockClient.return_value.chat.completions.create
+        # main loop: 4 tool-call rounds (max_iterations=3), then 1 more
+        # tool call in the first wrap-up round, THEN a real answer in the
+        # second wrap-up round.
+        mock_create.side_effect = [looping_response] * 5 + [wrap_up_success]
+        result = generate_insights_agentic(df, profile, max_iterations=3, verbose=False)
+
+    assert "synthesized after wrap-up" in result["report"]
+    assert len(result["tool_calls"]) == 5  # 4 main + 1 from the first wrap-up round
+
 def test_agent_recovers_from_forced_final_tool_use_error(df, profile):
     looping_response = _tool_call_message("df['a'].sum()")
     real_final_response = _final_message("## Key Patterns\n- a sums to 15, checked b too")
 
     with patch("groq_agent.Groq") as MockClient:
         mock_create = MockClient.return_value.chat.completions.create
-        # 4 looping tool-call rounds (max_iterations=3), then the forced-final
-        # request fails with the recoverable error, then succeeds once the
-        # recovered query has actually been run.
+        # 4 looping tool-call rounds (max_iterations=3), then WRAP_UP_ROUNDS=2
+        # more rounds where it's still insisting on tools, THEN the hard
+        # tools=None cutoff — which fails with the recoverable error, then
+        # succeeds once the recovered query has actually been run.
         mock_create.side_effect = (
-            [looping_response] * 4 + [_tool_use_failed_error("df['b'].unique()")] + [real_final_response]
+            [looping_response] * 4 + [looping_response] * 2
+            + [_tool_use_failed_error("df['b'].unique()")] + [real_final_response]
         )
         result = generate_insights_agentic(df, profile, max_iterations=3, verbose=False)
 
-    # 4 original tool calls + 1 recovered one from the failed forced-final attempt
-    assert len(result["tool_calls"]) == 5
+    # 4 main-loop + 2 wrap-up + 1 recovered from the failed forced-final attempt
+    assert len(result["tool_calls"]) == 7
     assert result["tool_calls"][-1]["expression"] == "df['b'].unique()"
     assert "a sums to 15, checked b too" in result["report"]
 
@@ -151,10 +197,11 @@ def test_agent_falls_back_gracefully_if_forced_final_error_repeats(df, profile):
 
     with patch("groq_agent.Groq") as MockClient:
         mock_create = MockClient.return_value.chat.completions.create
-        # Both forced-final attempts fail the same way — should not raise,
-        # should fall back to summarizing what's already in tool_call_log.
+        # Both forced-final attempts (after the main loop AND the wrap-up
+        # rounds all keep insisting on tools) fail the same way — should
+        # not raise, should fall back to summarizing what's already known.
         mock_create.side_effect = (
-            [looping_response] * 4
+            [looping_response] * 4 + [looping_response] * 2
             + [_tool_use_failed_error("df['b'].unique()")]
             + [_tool_use_failed_error("df['c'].unique()")]
         )
@@ -177,7 +224,7 @@ def test_agent_reraises_unrelated_bad_request_errors(df, profile):
 
     with patch("groq_agent.Groq") as MockClient:
         mock_create = MockClient.return_value.chat.completions.create
-        mock_create.side_effect = [looping_response] * 4 + [unrelated_error]
+        mock_create.side_effect = [looping_response] * 4 + [looping_response] * 2 + [unrelated_error]
         result = generate_insights_agentic(df, profile, max_iterations=3, verbose=False)
 
     # Not the recoverable shape -> breaks out of the grace loop immediately
