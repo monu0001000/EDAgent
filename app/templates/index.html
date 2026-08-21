@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EDAgent — open a case on your data</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Special+Elite&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="case-tab">
+      <span class="case-tab-label">FILE NO.</span>
+      <span class="case-tab-id" id="case-id">—</span>
+    </div>
+    <h1 class="wordmark">EDAgent</h1>
+    <p class="tagline">Open a case on your data. It investigates, you read the file.</p>
+  </div>
+</header>
+
+<main>
+
+  <!-- ============ UPLOAD / EMPTY STATE ============ -->
+  <section id="upload-section" class="panel upload-panel">
+    <div class="dropzone" id="dropzone">
+      <div class="dropzone-mark">＋</div>
+      <p class="dropzone-title">Drop a CSV to open a case</p>
+      <p class="dropzone-sub">or click to choose a file — any CSV, any subject</p>
+      <input type="file" id="file-input" accept=".csv" hidden>
+    </div>
+    <p class="upload-error" id="upload-error" hidden></p>
+  </section>
+
+  <!-- ============ CASE OVERVIEW (post-upload) ============ -->
+  <section id="case-section" class="case-section" hidden>
+
+    <div class="panel overview-panel">
+      <div class="overview-head">
+        <h2 class="section-label">Case overview</h2>
+        <button class="btn-ghost" id="new-case-btn">Open a different case</button>
+      </div>
+      <div class="overview-grid" id="overview-grid"></div>
+    </div>
+
+    <!-- ============ EXHIBITS (charts) ============ -->
+    <div class="panel exhibits-panel">
+      <h2 class="section-label">Exhibits</h2>
+      <div class="exhibits-grid" id="exhibits-grid"></div>
+    </div>
+
+    <!-- ============ INVESTIGATION ============ -->
+    <div class="panel investigate-panel">
+      <h2 class="section-label">Investigation</h2>
+      <div class="mode-row">
+        <button class="btn-primary" id="agentic-btn">Open investigation</button>
+        <button class="btn-secondary" id="single-shot-btn">Quick read</button>
+        <span class="mode-hint">Open investigation runs its own queries first — slower, sharper. Quick read summarizes the case file as-is.</span>
+      </div>
+
+      <div id="investigate-status" class="status-line" hidden></div>
+
+      <div id="evidence-log" class="evidence-log" hidden>
+        <h3 class="evidence-log-title">Evidence log</h3>
+        <ol class="evidence-list" id="evidence-list"></ol>
+      </div>
+
+      <article id="report-output" class="report-output" hidden></article>
+    </div>
+
+    <!-- ============ INTERROGATE ============ -->
+    <div class="panel interrogate-panel">
+      <h2 class="section-label">Interrogate the data</h2>
+      <p class="interrogate-sub">Ask about a specific row, or a general pattern. The agent looks for comparable history before it answers.</p>
+      <form id="ask-form" class="ask-form">
+        <input type="text" id="ask-input" class="ask-input" placeholder="e.g. is customer 80 a good deal for the enterprise plan?" autocomplete="off">
+        <button type="submit" class="btn-primary" id="ask-btn">Ask</button>
+      </form>
+      <div id="qa-list" class="qa-list"></div>
+    </div>
+
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <span>EDAgent — profiler, sandboxed query agent, and evaluation harness behind one case file.</span>
+</footer>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

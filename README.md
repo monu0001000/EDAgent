@@ -25,8 +25,9 @@ Runs entirely on **Groq's free API tier** (no credit card, no cost) — see Setu
 | Ask-a-question mode | `app/groq_agent.py` (`answer_question`) | ✅ Done, tested — domain-agnostic Q&A grounded in historical rows |
 | Streamlit UI | `app/streamlit_app.py` | ✅ Done, tested |
 | Evaluation harness | `app/evaluate.py`, `app/eval_datasets.py` | ✅ Done, tested — scores reports against profiler ground truth |
+| REST API | `app/api.py` | ✅ Done, tested — same engine as the UI, driven headlessly |
 
-**95/95 tests passing** across `test_pipeline.py`, `test_groq_agent.py`, `test_streamlit_app.py`, `test_evaluate.py`.
+**120/120 tests passing** across `test_pipeline.py`, `test_groq_agent.py`, `test_streamlit_app.py`, `test_evaluate.py`, `test_api.py`.
 
 ## Setup
 
@@ -68,6 +69,31 @@ rather than crashing the whole report. Covered by `test_agent_recovers_from_forc
 `test_agent_falls_back_gracefully_if_forced_final_error_repeats`, and
 `test_agent_reraises_unrelated_bad_request_errors` (confirming an unrelated 400, e.g. a bad
 API key, still surfaces normally rather than being silently swallowed by this recovery path).
+
+That first fix handled the crash, but a follow-up run against a real 7-column sales dataset
+showed the deeper issue it was papering over: the model hit its iteration cap still mid-
+investigation, got its tool access stripped, tried to call one anyway, got the 400, and even
+the one recovered grace query wasn't enough to satisfy it — it insisted a second time too,
+which meant the *actual* final output was the raw fallback dump of every tool query result
+with no synthesized narrative at all. Not a crash, but not a real report either. Root fix:
+`WRAP_UP_ROUNDS` in `groq_agent.py` now gives the model up to 2 extra rounds, right when
+`max_iterations` runs out, where tools stay technically available but a strong system
+message tells it to stop investigating and answer in plain text. If it calls a tool anyway
+during a wrap-up round, that just succeeds as a normal bounded tool call instead of
+triggering the API-level tools=None mismatch — the hard `tools=None` cutoff (and its 400
+recovery logic above) is now only reached as an absolute last resort, not the first thing
+tried the moment the budget runs out. Covered by
+`test_agent_answers_during_wrap_up_round_instead_of_needing_tools_stripped`.
+
+Also fixed while investigating the "it took too long" report on that same run: `gpt-oss-120b`
+is a reasoning model and spends real time "thinking" by default, even for a simple "which
+groupby should I run next" decision — across up to `max_iterations + WRAP_UP_ROUNDS` calls in
+one investigation, that adds up to real, user-visible latency. `_create_with_retry` now
+defaults `reasoning_effort="low"` specifically when the model name contains `"gpt-oss"`
+(gated rather than applied unconditionally, since `reasoning_effort` isn't a universally
+supported parameter — forcing it on an arbitrary `GROQ_MODEL` override risks a 400 on models
+that don't recognize it). Covered by `test_reasoning_effort_defaults_to_low_for_gpt_oss_models`
+and `test_reasoning_effort_not_forced_on_non_gpt_oss_models`.
 If you hit a `model_decommissioned` error on any Groq model in the future, check
 https://console.groq.com/docs/deprecations for the current recommended replacement — but
 also actually exercise the agentic loop against the new model before assuming the swap is
@@ -89,8 +115,85 @@ Upload a CSV, review the auto-generated profile and charts, then either:
   then answers grounded in what it actually finds — see "Ask-a-question mode" below for how
   it decides what counts as a fair comparison for whatever your columns actually are.
 
+## REST API
 
-## Run individual pieces / tests
+Everything the Streamlit UI does is also available headlessly via `app/api.py` — proof the
+actual engine (profiler, sandbox, agent) was never tied to Streamlit specifically, just
+driven by it. `api.py` also serves its own web UI at `/` (`templates/index.html` +
+`static/app.js`/`static/style.css`) — a small vanilla-JS frontend, no framework or build
+step, built around a "case file" idea: the agent investigates your data like building a
+case, tool queries are logged as numbered evidence, and anomalies get flagged rather than
+buried. Useful for scripting against directly too, or wiring up a different frontend
+entirely.
+
+```bash
+cd app
+python3 api.py    # dev server on http://localhost:5000 — open it in a browser for the UI
+```
+
+| Method | Endpoint | Does |
+|---|---|---|
+| GET | `/health` | Liveness check |
+| POST | `/datasets` | Upload a CSV (`multipart/form-data`, field `file`) → `dataset_id` + profile |
+| GET | `/datasets/<id>` | Re-fetch a dataset's profile |
+| GET | `/datasets/<id>/charts` | Auto-generated charts as Plotly JSON specs |
+| POST | `/datasets/<id>/report` | `{"mode": "agentic"\|"single_shot"}` → generated report |
+| POST | `/datasets/<id>/ask` | `{"question": "..."}` → grounded answer |
+| DELETE | `/datasets/<id>` | Free the in-memory dataset |
+
+```bash
+# Upload a CSV and get back a dataset_id + profile
+curl -X POST -F "file=@data/sample.csv" http://localhost:5000/datasets
+
+# Generate an agentic report for it
+curl -X POST http://localhost:5000/datasets/<dataset_id>/report \
+  -H "Content-Type: application/json" -d '{"mode": "agentic"}'
+
+# Ask it something specific
+curl -X POST http://localhost:5000/datasets/<dataset_id>/ask \
+  -H "Content-Type: application/json" -d '{"question": "which plan has the highest churn risk?"}'
+```
+
+**Known limitation:** datasets live in an in-memory dict (`api.py`'s `DATASET_STORE`), not a
+database. Fine for local use, a demo, or a single-process deployment — but data is lost on
+restart and NOT shared across multiple worker processes (e.g. `gunicorn -w 4`). If this needs
+to survive restarts or scale beyond one process, swap `DATASET_STORE` for Redis or a real
+database; nothing else in the file would need to change, since every route only ever touches
+the store through `get_dataset()`/`store_dataset()`/`delete_dataset()`. Also: no
+authentication and no upload size limit — fine for a portfolio/demo deployment, not something
+to expose publicly with real data without adding both. Covered by `test_api.py` (19 tests,
+using Flask's test client — no live server or network calls needed; report/ask endpoint tests
+mock the Groq client the same way `test_groq_agent.py` does).
+
+### Deploying the Flask app
+
+Flask's built-in dev server (`python3 api.py`) explicitly warns against production use — for
+a real deployment, use a proper WSGI server: `Procfile` (repo root) runs
+
+```
+gunicorn --chdir app -w 1 -b 0.0.0.0:$PORT api:app
+```
+
+**`-w 1` (a single worker) is deliberate, not a placeholder to raise later.** `DATASET_STORE`
+is an in-memory dict local to one process — multiple gunicorn workers would each hold a
+*different* copy, so a dataset uploaded to worker A would 404 if a later request happened to
+land on worker B. Don't bump the worker count without first swapping `DATASET_STORE` for
+something shared across processes (Redis, a real database), per the Known Limitation above.
+
+Any platform that runs a persistent process works (this rules out purely serverless/
+function-per-request platforms — the in-memory store needs a process that stays alive between
+requests). [Render](https://render.com)'s free tier is a straightforward fit:
+
+1. New → Web Service → connect this repo.
+2. Build command: `pip install -r requirements.txt`
+3. Start command: `gunicorn --chdir app -w 1 -b 0.0.0.0:$PORT api:app` (or leave it blank —
+   Render auto-detects the `Procfile`).
+4. Add `GROQ_API_KEY` under Environment → Environment Variables.
+5. Deploy. Render's free tier spins the service down after inactivity and takes ~30-60s to
+   wake back up on the next request — expected, not a bug, if the first request after a while
+   away looks slow.
+
+
 
 ```bash
 cd app
@@ -101,7 +204,7 @@ python3 groq_insight_generator.py   # single-shot report — needs GROQ_API_KEY
 python3 groq_agent.py               # agentic report — needs GROQ_API_KEY, watch it investigate
 python3 evaluate.py                 # evaluation harness — needs GROQ_API_KEY, see Evaluation below
 
-python3 -m pytest -v                # full test suite (95 tests)
+python3 -m pytest -v                # full test suite (120 tests)
 ```
 
 ## Architecture
@@ -312,6 +415,12 @@ query result — is a natural next step.
 
 ## Resume bullets
 
+- Built a Flask REST API (`app/api.py`) exposing the full analysis engine — profiling,
+  auto-visualization, agentic report generation, and Q&A — headlessly, proving the core logic
+  was never coupled to the Streamlit UI. Building it against real endpoints (not just the
+  Streamlit flow) surfaced a real data-corruption bug in the repo's sample dataset that had
+  been silently breaking demo runs.
+
 - Built EDAgent, an AI-powered data analysis tool that autonomously profiles, visualizes,
   and generates natural-language insight reports from arbitrary CSV files, using LLM
   tool-calling to dynamically drive exploratory analysis rather than a fixed pipeline.
@@ -346,5 +455,5 @@ query result — is a natural next step.
 - Achieved flat LLM token usage regardless of dataset size by sending only aggregated
   profile statistics, never raw rows, to the model.
 - Shipped a Streamlit UI with headless integration tests (Streamlit `AppTest`) covering the
-  full upload-to-report flow, reaching 95 passing tests across the project, enforced on
+  full upload-to-report flow, reaching 120 passing tests across the project, enforced on
   every push via GitHub Actions CI.
