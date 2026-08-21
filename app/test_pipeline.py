@@ -60,6 +60,25 @@ def test_id_like_column_detected():
     s = pd.Series(range(100))
     assert detect_column_type(s) == "id_like"
 
+def test_boolean_column_classified_as_categorical_not_numeric():
+    """Regression test: pandas.api.types.is_numeric_dtype(series) returns
+    True for bool dtype, so without an explicit check a True/False column
+    fell through into "numeric" and got IQR outlier detection run on it —
+    which crashed outright ("numpy boolean subtract... not supported")
+    the moment two bool values needed subtracting for an IQR bound. Hit in
+    production on a real uploaded CSV with an incident_reported column."""
+    s = pd.Series([True, False, False, True, False] * 20)
+    assert detect_column_type(s) == "categorical"
+
+def test_profile_dataframe_handles_boolean_column_without_crashing():
+    df = pd.DataFrame({
+        "id": range(100),
+        "incident_reported": [True, False, False, True, False] * 20,
+    })
+    profile = profile_dataframe(df)  # must not raise
+    assert profile["columns"]["incident_reported"]["inferred_type"] == "categorical"
+    assert "outliers" not in profile["columns"]["incident_reported"]
+
 def test_empty_column_handled():
     s = pd.Series([None, None, None])
     assert detect_column_type(s) == "empty"

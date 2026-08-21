@@ -35,6 +35,10 @@ def detect_column_type(series: pd.Series) -> str:
         except Exception:
             pass
 
+
+    if pd.api.types.is_bool_dtype(series):
+        return "categorical"
+
     # Numeric check
     if pd.api.types.is_numeric_dtype(series):
         # ID-like: integer, unique, or sequential-looking
