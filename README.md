@@ -27,7 +27,7 @@ Runs entirely on **Groq's free API tier** (no credit card, no cost) — see Setu
 | Evaluation harness | `app/evaluate.py`, `app/eval_datasets.py` | ✅ Done, tested — scores reports against profiler ground truth |
 | REST API | `app/api.py` | ✅ Done, tested — same engine as the UI, driven headlessly |
 
-**120/120 tests passing** across `test_pipeline.py`, `test_groq_agent.py`, `test_streamlit_app.py`, `test_evaluate.py`, `test_api.py`.
+**123/123 tests passing** across `test_pipeline.py`, `test_groq_agent.py`, `test_streamlit_app.py`, `test_evaluate.py`, `test_api.py`.
 
 ## Setup
 
@@ -171,7 +171,7 @@ Flask's built-in dev server (`python3 api.py`) explicitly warns against producti
 a real deployment, use a proper WSGI server: `Procfile` (repo root) runs
 
 ```
-gunicorn --chdir app -w 1 -b 0.0.0.0:$PORT api:app
+gunicorn --chdir app -w 1 --timeout 300 -b 0.0.0.0:$PORT api:app
 ```
 
 **`-w 1` (a single worker) is deliberate, not a placeholder to raise later.** `DATASET_STORE`
@@ -180,18 +180,44 @@ is an in-memory dict local to one process — multiple gunicorn workers would ea
 land on worker B. Don't bump the worker count without first swapping `DATASET_STORE` for
 something shared across processes (Redis, a real database), per the Known Limitation above.
 
+**`--timeout 300` is also deliberate, not generous by accident.** Gunicorn's default worker
+timeout is 30 seconds — real production testing on a free-tier host showed report generation
+regularly taking well past that, so the default silently SIGKILLs the worker mid-request and
+the client sees a bare, uninformative HTML 500 with no useful error message at all. Found via
+an actual crash: a real deployment's logs showed the worker dying mid-`time.sleep()` inside
+the Groq SDK's *own* internal retry-with-backoff — which was the second, deeper issue this
+surfaced. `Groq(...)`'s client constructor has its own built-in retry logic, separate from and
+invisible to `_create_with_retry` in `groq_agent.py`/`groq_insight_generator.py`. Both retrying
+independently meant a rate-limited request (Groq's free tier appears to throttle shared-IP
+hosting providers harder than a home connection) could sleep for a long, unpredictable,
+unlogged stretch inside the SDK's own retry before either our own retry logic or gunicorn's
+timeout ever got visibility into what was happening. Fixed by passing `max_retries=0` to the
+`Groq()` client so all retry behavior goes through `_create_with_retry` instead, which is
+visible (prints every attempt), respects `Retry-After`, and is bounded.
+
+Two more mitigations from the same incident, both env-var-overridable so a slow/rate-limited
+deployment can trade investigation depth for speed without a code change:
+- `EDAGENT_MAX_ITERATIONS` (default 7) / `EDAGENT_ASK_MAX_ITERATIONS` (default 6) in `api.py` —
+  set lower on a host getting rate-limited hard, since each iteration is a real network call.
+- The web UI's status line now ticks a live elapsed-time counter (`static/app.js`) instead of
+  showing a static "Investigating…" message the whole time. A genuinely slow-but-working
+  request looked indistinguishable from a hung one before this — several-minute waits under
+  real rate limiting are visible now, not silently confusing.
+
 Any platform that runs a persistent process works (this rules out purely serverless/
 function-per-request platforms — the in-memory store needs a process that stays alive between
 requests). [Render](https://render.com)'s free tier is a straightforward fit:
 
 1. New → Web Service → connect this repo.
-2. Build command: `pip install -r requirements.txt`
-3. Start command: `gunicorn --chdir app -w 1 -b 0.0.0.0:$PORT api:app` (or leave it blank —
-   Render auto-detects the `Procfile`).
-4. Add `GROQ_API_KEY` under Environment → Environment Variables.
-5. Deploy. Render's free tier spins the service down after inactivity and takes ~30-60s to
+2. Root Directory: `app`
+3. Build command: `pip install -r ../requirements.txt`
+4. Start command: `gunicorn -w 1 --timeout 300 -b 0.0.0.0:$PORT api:app`
+5. Add `GROQ_API_KEY` under Environment → Environment Variables.
+6. Deploy. Render's free tier spins the service down after inactivity and takes ~30-60s to
    wake back up on the next request — expected, not a bug, if the first request after a while
-   away looks slow.
+   away looks slow. Separately, expect agentic report generation to sometimes take a couple of
+   minutes on the free tier specifically — the elapsed-time UI feedback above exists because of
+   this, not because the app is actually stuck.
 
 
 
@@ -204,7 +230,7 @@ python3 groq_insight_generator.py   # single-shot report — needs GROQ_API_KEY
 python3 groq_agent.py               # agentic report — needs GROQ_API_KEY, watch it investigate
 python3 evaluate.py                 # evaluation harness — needs GROQ_API_KEY, see Evaluation below
 
-python3 -m pytest -v                # full test suite (120 tests)
+python3 -m pytest -v                # full test suite (123 tests)
 ```
 
 ## Architecture
@@ -455,5 +481,5 @@ query result — is a natural next step.
 - Achieved flat LLM token usage regardless of dataset size by sending only aggregated
   profile statistics, never raw rows, to the model.
 - Shipped a Streamlit UI with headless integration tests (Streamlit `AppTest`) covering the
-  full upload-to-report flow, reaching 120 passing tests across the project, enforced on
+  full upload-to-report flow, reaching 123 passing tests across the project, enforced on
   every push via GitHub Actions CI.

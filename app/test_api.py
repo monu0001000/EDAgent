@@ -204,6 +204,22 @@ def test_generate_report_agentic_mocked(client, monkeypatch):
     assert "mocked report content" in body["report"]
     assert body["tool_calls"] == []
 
+def test_report_endpoint_respects_max_iterations_override(client, monkeypatch):
+    """AGENTIC_MAX_ITERATIONS is overridable via EDAGENT_MAX_ITERATIONS
+    specifically so a rate-limited/free-tier deployment can trade
+    investigation depth for speed without a code change — confirms the
+    override actually reaches generate_insights_agentic's call, not just
+    that the env var parses."""
+    monkeypatch.setenv("GROQ_API_KEY", "fake-key")
+    monkeypatch.setattr(api_module, "AGENTIC_MAX_ITERATIONS", 2)
+    dataset_id = _upload_sample(client)
+
+    with patch("groq_agent.generate_insights_agentic") as mock_generate:
+        mock_generate.return_value = {"report": "ok", "tool_calls": [], "iterations": 0}
+        client.post(f"/datasets/{dataset_id}/report", json={"mode": "agentic"})
+
+    assert mock_generate.call_args.kwargs["max_iterations"] == 2
+
 def test_generate_report_single_shot_mocked(client, monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "fake-key")
     dataset_id = _upload_sample(client)

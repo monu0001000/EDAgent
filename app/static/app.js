@@ -203,7 +203,21 @@
     setButtonsDisabled(true);
     evidenceLog.hidden = true;
     reportOutput.hidden = true;
-    setStatus(mode === "agentic" ? "Investigating — running its own queries against the data…" : "Reading the case file…", "loading");
+
+    const baseLabel = mode === "agentic" ? "Investigating — running its own queries against the data" : "Reading the case file";
+    const startedAt = Date.now();
+    setStatus(`${baseLabel}…`, "loading");
+    // Ticking elapsed-time label: without this, a genuinely slow-but-
+    // working request (a rate-limited free-tier API can legitimately take
+    // several minutes — this has actually happened in production) looks
+    // identical to a hung one. A visible, moving number is the cheapest
+    // possible signal that something is still happening.
+    const tickInterval = setInterval(() => {
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      let label = `${baseLabel}… (${elapsed}s)`;
+      if (elapsed > 30) label += " — free-tier API limits can make this slow, still working";
+      setStatus(label, "loading");
+    }, 1000);
 
     try {
       const resp = await fetch(`/datasets/${datasetId}/report`, {
@@ -227,6 +241,7 @@
     } catch (err) {
       setStatus("Couldn't reach the server: " + err.message, "error");
     } finally {
+      clearInterval(tickInterval);
       setButtonsDisabled(false);
     }
   }
@@ -272,6 +287,17 @@
       </div>
     `);
 
+    const startedAt = Date.now();
+    const answerEl = () => document.getElementById(pendingId)?.querySelector(".qa-answer");
+    const tickInterval = setInterval(() => {
+      const el = answerEl();
+      if (!el) return;
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      el.textContent = elapsed > 20
+        ? `Looking through the data… (${elapsed}s — free-tier API limits can make this slow)`
+        : `Looking through the data… (${elapsed}s)`;
+    }, 1000);
+
     try {
       const resp = await fetch(`/datasets/${datasetId}/ask`, {
         method: "POST",
@@ -291,6 +317,7 @@
     } catch (err) {
       document.getElementById(pendingId).querySelector(".qa-answer").textContent = "Couldn't reach the server: " + err.message;
     } finally {
+      clearInterval(tickInterval);
       askBtn.disabled = false;
       askInput.disabled = false;
       askInput.value = "";

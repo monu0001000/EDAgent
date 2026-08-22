@@ -55,6 +55,15 @@ app = Flask(__name__)
 DATASET_STORE: dict[str, dict] = {}
 _STORE_LOCK = threading.Lock()
 
+# Overridable per-deployment via env vars — no code change needed to trade
+# investigation depth for speed. Defaults match generate_insights_agentic's/
+# answer_question's own defaults; set lower on a rate-limited or free-tier
+# host (each iteration is a real network call, and Groq's free tier can
+# throttle shared-IP hosting providers much harder than a home connection —
+# a real deployment hit a 5-minute investigation from retries stacking up).
+AGENTIC_MAX_ITERATIONS = int(os.environ.get("EDAGENT_MAX_ITERATIONS", "7"))
+ASK_MAX_ITERATIONS = int(os.environ.get("EDAGENT_ASK_MAX_ITERATIONS", "6"))
+
 
 def store_dataset(df: pd.DataFrame, profile: dict) -> str:
     dataset_id = uuid.uuid4().hex
@@ -155,7 +164,7 @@ def generate_report(dataset_id):
     try:
         if mode == "agentic":
             from groq_agent import generate_insights_agentic
-            result = generate_insights_agentic(dataset["df"], dataset["profile"], model=model, verbose=False)
+            result = generate_insights_agentic(dataset["df"], dataset["profile"], model=model, max_iterations=AGENTIC_MAX_ITERATIONS, verbose=False)
             return jsonify({"mode": mode, "report": result["report"], "tool_calls": result["tool_calls"], "iterations": result["iterations"]})
         else:
             from groq_insight_generator import generate_insights
@@ -184,7 +193,7 @@ def ask_question(dataset_id):
 
     try:
         from groq_agent import answer_question
-        result = answer_question(dataset["df"], dataset["profile"], question, model=model, verbose=False)
+        result = answer_question(dataset["df"], dataset["profile"], question, model=model, max_iterations=ASK_MAX_ITERATIONS, verbose=False)
         return jsonify({"question": question, "answer": result["answer"], "tool_calls": result["tool_calls"], "iterations": result["iterations"]})
     except UnsafeQueryError as e:
         return jsonify({"error": f"Sandbox rejected a query unexpectedly: {e}"}), 500
