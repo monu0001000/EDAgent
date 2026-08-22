@@ -73,7 +73,11 @@ def generate_insights(profile: dict, chart_names: list[str], model: str | None =
     Model defaults to the GROQ_MODEL env var if set, otherwise "openai/gpt-oss-120b".
     """
     model = model or os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
-    client = Groq(api_key=os.environ.get("GROQ_API_KEY"), timeout=45.0)
+    # max_retries=0: see groq_agent.py's client instantiation for why —
+    # same reasoning applies here even though this single-shot path
+    # doesn't have its own custom retry wrapper; a silent SDK-internal
+    # retry sleep is still an unpredictable, unlogged stretch of time.
+    client = Groq(api_key=os.environ.get("GROQ_API_KEY"), timeout=45.0, max_retries=0)
 
     response = client.chat.completions.create(
         model=model,

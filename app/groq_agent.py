@@ -352,7 +352,18 @@ def _run_tool_loop(
     Returns {"final_text": str, "tool_calls": [...], "iterations": int}.
     """
     model = model or os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
-    client = Groq(api_key=os.environ.get("GROQ_API_KEY"), timeout=45.0)
+    # max_retries=0 is deliberate: the SDK has its own built-in retry-
+    # with-backoff, separate from and invisible to _create_with_retry
+    # below. Both retrying independently means a rate-limited request can
+    # sleep for a long, unpredictable, unlogged stretch inside the SDK's
+    # own retry before our code (or gunicorn's request timeout) ever gets
+    # a chance to see what's happening — this is exactly what crashed a
+    # real deployment: gunicorn's worker timeout fired mid-sleep inside
+    # the SDK's internal retry and got SIGKILLed, with none of our own
+    # retry logging ever printed. Disabling the SDK's retries puts all
+    # retry behavior through _create_with_retry instead, which is
+    # visible (prints each attempt), respects Retry-After, and is capped.
+    client = Groq(api_key=os.environ.get("GROQ_API_KEY"), timeout=45.0, max_retries=0)
 
     base_messages = [
         {"role": "system", "content": system_prompt},
